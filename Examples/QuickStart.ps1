@@ -6,7 +6,7 @@
     Prerequisites:
       1. npm i -g @openai/codex
       2. codex login                    # authenticate once
-      3. Import-Module .\CodexAppServer.psm1
+      3. Import-Module .\PSUnplugged.psm1
 
     The module auto-discovers the native codex.exe inside node_modules.
     If it fails, set $env:CODEX_EXE or pass -CodexPath:
@@ -17,7 +17,7 @@
       Get-ChildItem (npm root -g) -Recurse -Filter codex.exe | Where-Object { $_.Length -gt 1MB }
 #>
 
-Import-Module .\CodexAppServer.psm1 -Force
+Import-Module $PSScriptRoot\..\PSUnplugged.psm1 -Force
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Example 1: Quick question
@@ -26,7 +26,7 @@ Import-Module .\CodexAppServer.psm1 -Force
 Write-Host "`n=== Example 1: Quick Question ===" -ForegroundColor Cyan
 
 $session = Start-CodexSession
-$answer  = Invoke-CodexQuestion -Session $session -Text "What is the capital of France?"
+$answer = Invoke-CodexQuestion -Session $session -Text "What is the capital of France?"
 Write-Host "Answer: $answer"
 Stop-CodexSession -Session $session
 
@@ -37,7 +37,7 @@ Stop-CodexSession -Session $session
 Write-Host "`n=== Example 2: Multi-turn ===" -ForegroundColor Cyan
 
 $session = Start-CodexSession
-$thread  = New-CodexThread -Session $session -Cwd (Get-Location).Path
+$thread = New-CodexThread -Session $session -Cwd (Get-Location).Path
 
 $r1 = Invoke-CodexTurn -Session $session -ThreadId $thread.id -Text "List the files in this directory"
 Write-Host "Turn 1:`n$($r1.AgentText)"
@@ -53,7 +53,7 @@ Stop-CodexSession -Session $session
 
 Write-Host "`n=== Example 3: Sandboxed Command ===" -ForegroundColor Cyan
 
-$session   = Start-CodexSession
+$session = Start-CodexSession
 $cmdResult = Invoke-CodexCommand -Session $session -Command @("git", "status") -Cwd (Get-Location).Path
 Write-Host "Exit code: $($cmdResult.exitCode)"
 Write-Host "Output:`n$($cmdResult.stdout)"
