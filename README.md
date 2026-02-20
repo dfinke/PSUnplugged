@@ -110,6 +110,8 @@ Stop-CodexSession -Session $session
 
 ---
 
+<!-- Provider-Agnostic section under review — wire_api compat being validated across providers
+
 ## Provider-Agnostic
 
 The Codex App Server supports any OpenAI-compatible provider. Add a block to `~/.codex/config.toml` (global) or `.codex/config.toml` in your project root (project-scoped) and point `env_key` at the environment variable holding your API key — Codex picks it up automatically, nothing hardcoded.
@@ -160,7 +162,7 @@ $env:OPENAI_BASE_URL = "http://localhost:11434/v1"
 
 > **Note:** Providers that don't speak the OpenAI wire format (like Anthropic) need a translation proxy such as [LiteLLM](https://github.com/BerriAI/litellm).
 
----
+-->
 
 ## More Than a Chat Client
 
