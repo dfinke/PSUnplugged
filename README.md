@@ -112,7 +112,11 @@ Stop-CodexSession -Session $session
 
 ## Provider-Agnostic
 
-The Codex App Server supports any OpenAI-compatible provider. Add a block to `~/.codex/config.toml` and point `env_key` at the environment variable holding your API key — Codex picks it up automatically, nothing hardcoded:
+The Codex App Server supports any OpenAI-compatible provider. Add a block to `~/.codex/config.toml` (global) or `.codex/config.toml` in your project root (project-scoped) and point `env_key` at the environment variable holding your API key — Codex picks it up automatically, nothing hardcoded.
+
+> **Project-scoped config:** drop a `.codex/config.toml` in your repo root and Codex uses it automatically for that project (trusted projects only). Providers, MCP servers, model settings — all scoped to that repo. Nothing bleeds into your global config.
+
+Example `config.toml`:
 
 ```toml
 # xAI Grok
@@ -166,6 +170,10 @@ The Codex App Server isn't just a model endpoint — it's a full agentic runtime
 - **Threads and memory** — persistent multi-turn conversations with full history
 - **Approval policies** — control whether the agent can execute commands and modify files, or stay read-only
 - **AGENTS.md and Skills** — already have an AGENTS.md in your repo? It works automatically. Your project context, your instructions, zero extra config
+  - `AGENTS.md` lives at your **repo root** (e.g. `c:\PSUnplugged\AGENTS.md`) — the Codex App Server picks it up automatically for any trusted project checkout
+  - **Skills** live under `.codex/skills/` in your repo root (e.g. `.codex/skills/my-skill.md`) — each file describes a reusable capability the model can invoke by name
+  - A **global** `AGENTS.md` can also live at `~/.codex/AGENTS.md` to apply instructions across all projects
+  - Skills and AGENTS.md stack: global instructions + repo-level instructions + skills are all merged into the agent's context at session start
 - **Provider-agnostic** — swap models without changing client code
 
 PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the cloud version of the app-server, the same code points at a URL instead of a local process.
