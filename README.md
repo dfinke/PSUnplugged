@@ -51,14 +51,15 @@ Examples/
    ```powershell
    npm i -g @openai/codex
    ```
-4. **Authenticate** — runs interactively on first use; have your OpenAI API key ready:
-   ```powershell
-   codex login
-   ```
-   Or skip login and pass your key directly at runtime:
-   ```powershell
-   $session = Start-CodexSession -ApiKey $env:OPENAI_API_KEY
-   ```
+4. **Authenticate** — choose one:
+   - **ChatGPT account** (free tier, supports `gpt-5.1-codex` only):
+     ```powershell
+     codex login
+     ```
+   - **OpenAI API key** (required for `gpt-4.1`, `gpt-4o`, etc.) — pass it directly at runtime, no login needed:
+     ```powershell
+     .\Examples\Start-AgentChat.ps1 -ApiKey $env:OPENAI_API_KEY
+     ```
 5. **Clone this repo**
    ```powershell
    git clone https://github.com/dfinke/PSUnplugged
@@ -73,7 +74,11 @@ Examples/
 **Interactive chat**
 
 ```powershell
+# ChatGPT account (default model)
 .\Examples\Start-AgentChat.ps1
+
+# OpenAI API key — use any model
+.\Examples\Start-AgentChat.ps1 -Model gpt-4.1 -ApiKey $env:OPENAI_API_KEY
 ```
 
 **One-liner from a script**
@@ -103,7 +108,7 @@ Stop-CodexSession -Session $session
 
 ```
 /new         start a fresh thread
-/model <n>   switch model mid-session
+/model <n>   switch model and start a new thread
 /verbose     toggle raw JSON-RPC output
 /quit        exit
 ```
