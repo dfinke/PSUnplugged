@@ -1,7 +1,7 @@
 @{
     RootModule        = 'PSUnplugged.psm1'
     ModuleVersion     = '0.1.0'
-    GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+    GUID              = '61f3ddba-3a4a-495e-95ac-6c47aaed4c24'
     Author            = 'Douglas Finke'
     CompanyName       = 'Douglas Finke'
     Copyright         = '(c) 2026 Douglas Finke. All rights reserved.'
