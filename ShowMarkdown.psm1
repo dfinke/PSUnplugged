@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Renders Markdown text with ANSI colors and formatting in the terminal.
 
@@ -22,6 +22,29 @@
     Show-Markdown $response
 #>
 
+function Get-DisplayWidth {
+    param([string]$Text)
+    $w = 0
+    foreach ($ch in $Text.ToCharArray()) {
+        $cp = [int]$ch
+        # CJK, fullwidth, and common wide Unicode ranges
+        if (($cp -ge 0x1100 -and $cp -le 0x115F) -or
+            ($cp -ge 0x2E80 -and $cp -le 0x303E) -or
+            ($cp -ge 0x3040 -and $cp -le 0x9FFF) -or
+            ($cp -ge 0xAC00 -and $cp -le 0xD7AF) -or
+            ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
+            ($cp -ge 0xFE30 -and $cp -le 0xFE6F) -or
+            ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
+            ($cp -ge 0xFFE0 -and $cp -le 0xFFE6)) {
+            $w += 2
+        }
+        else {
+            $w += 1
+        }
+    }
+    $w
+}
+
 function Show-Markdown {
     [CmdletBinding()]
     param(
@@ -43,34 +66,34 @@ function Show-Markdown {
         if ([string]::IsNullOrWhiteSpace($text)) { return }
 
         # ── ANSI escape sequences ──
-        $esc       = [char]27
-        $reset     = "$esc[0m"
-        $bold      = "$esc[1m"
-        $dim       = "$esc[2m"
-        $italic    = "$esc[3m"
+        $esc = [char]27
+        $reset = "$esc[0m"
+        $bold = "$esc[1m"
+        $dim = "$esc[2m"
+        $italic = "$esc[3m"
         $underline = "$esc[4m"
-        $strike    = "$esc[9m"
+        $strike = "$esc[9m"
 
         # Colors
-        $cH1       = "$esc[1;38;5;39m"     # Bold bright blue
-        $cH2       = "$esc[1;38;5;114m"    # Bold green
-        $cH3       = "$esc[1;38;5;214m"    # Bold orange
-        $cH4       = "$esc[1;38;5;183m"    # Bold lavender
-        $cCode     = "$esc[38;5;223m"      # Warm yellow for inline code
-        $cCodeBg   = "$esc[48;5;236m"      # Dark background for inline code
-        $cBlock    = "$esc[38;5;250m"      # Light gray for code blocks
-        $cBlockBg  = "$esc[48;5;235m"      # Darker background for blocks
-        $cBlockLn  = "$esc[38;5;240m"      # Line numbers
-        $cLang     = "$esc[38;5;245m"      # Language label
-        $cBullet   = "$esc[38;5;75m"       # Blue bullets
-        $cQuote    = "$esc[38;5;248m"      # Gray quotes
+        $cH1 = "$esc[1;38;5;39m"     # Bold bright blue
+        $cH2 = "$esc[1;38;5;114m"    # Bold green
+        $cH3 = "$esc[1;38;5;214m"    # Bold orange
+        $cH4 = "$esc[1;38;5;183m"    # Bold lavender
+        $cCode = "$esc[38;5;223m"      # Warm yellow for inline code
+        $cCodeBg = "$esc[48;5;236m"      # Dark background for inline code
+        $cBlock = "$esc[38;5;250m"      # Light gray for code blocks
+        $cBlockBg = "$esc[48;5;235m"      # Darker background for blocks
+        $cBlockLn = "$esc[38;5;240m"      # Line numbers
+        $cLang = "$esc[38;5;245m"      # Language label
+        $cBullet = "$esc[38;5;75m"       # Blue bullets
+        $cQuote = "$esc[38;5;248m"      # Gray quotes
         $cQuoteBar = "$esc[38;5;240m"      # Dark gray bar
-        $cLink     = "$esc[4;38;5;75m"     # Underlined blue
-        $cBold     = "$esc[1;38;5;255m"    # Bright white bold
-        $cItalic   = "$esc[3;38;5;252m"    # Italic light
-        $cHR       = "$esc[38;5;240m"      # Dim horizontal rule
-        $cTable    = "$esc[38;5;245m"      # Table borders
-        $cTableH   = "$esc[1;38;5;75m"     # Table headers
+        $cLink = "$esc[4;38;5;75m"     # Underlined blue
+        $cBold = "$esc[1;38;5;255m"    # Bright white bold
+        $cItalic = "$esc[3;38;5;252m"    # Italic light
+        $cHR = "$esc[38;5;240m"      # Dim horizontal rule
+        $cTable = "$esc[38;5;245m"      # Table borders
+        $cTableH = "$esc[1;38;5;75m"     # Table headers
 
         $lines = $text -split "`n"
         $i = 0
@@ -89,28 +112,39 @@ function Show-Markdown {
                     $codeLines = @()
                     $i++
                     continue
-                } else {
+                }
+                else {
                     # Render the collected code block
                     $inCodeBlock = $false
-                    $width = ($codeLines | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
-                    if ($width -lt 40) { $width = 40 }
-                    $width += 4
+
+                    # Trim trailing whitespace, expand tabs, measure display width
+                    $codeLines = $codeLines | ForEach-Object { $_.TrimEnd() -replace "`t", "    " }
+                    $displayWidths = @($codeLines | ForEach-Object { Get-DisplayWidth $_ })
+                    $maxDisplay = ($displayWidths | Measure-Object -Maximum).Maximum
+                    if ($null -eq $maxDisplay -or $maxDisplay -lt 1) { $maxDisplay = 1 }
+                    $boxInner = $maxDisplay + 7  # │ + space + num(3) + space + content + space + │
 
                     if ($codeLang) {
-                        Write-Host "  $cLang╭─ $codeLang $("─" * [Math]::Max(0, $width - $codeLang.Length - 5))╮$reset"
-                    } else {
-                        Write-Host "  $cLang╭$("─" * ($width - 1))╮$reset"
+                        $langExtra = 4 + $codeLang.Length  # ╭─ LANG ╮ minus dashes
+                        Write-Host "  $cLang╭─ $codeLang $("─" * [Math]::Max(0, $boxInner - $langExtra))╮$reset"
+                    }
+                    else {
+                        Write-Host "  $cLang╭$("─" * ($boxInner - 1))╮$reset"
                     }
 
                     $lineNum = 1
+                    $lineIdx = 0
                     foreach ($cl in $codeLines) {
                         $numStr = $lineNum.ToString().PadLeft(3)
-                        $padded = $cl.PadRight($width - 7)
+                        $dw = $displayWidths[$lineIdx]
+                        $pad = $maxDisplay - $dw
+                        $padded = $cl + (" " * [Math]::Max(0, $pad))
                         Write-Host "  $cLang│$reset $cBlockLn$numStr$reset $cBlockBg$cBlock$padded$reset $cLang│$reset"
                         $lineNum++
+                        $lineIdx++
                     }
 
-                    Write-Host "  $cLang╰$("─" * ($width - 1))╯$reset"
+                    Write-Host "  $cLang╰$("─" * ($boxInner - 1))╯$reset"
                     Write-Host ""
                     $i++
                     continue
