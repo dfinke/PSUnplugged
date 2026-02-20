@@ -13,8 +13,8 @@
       - Set $env:CODEX_EXE to the native binary path (or edit $CodexExe below)
 
     Usage:
-      .\Chat-Codex.ps1
-      .\Chat-Codex.ps1 -Model "gpt-5.1-codex" -Cwd "D:\myproject"
+      .\Examples\Start-AgentChat.ps1
+      .\Examples\Start-AgentChat.ps1 -Model "gpt-5.1-codex" -Cwd "D:\myproject"
 
     Commands inside the chat:
       /quit, /exit, /q   - end the session
@@ -30,7 +30,7 @@ param(
 )
 
 
-Import-Module $PSScriptRoot\ShowMarkdown.psm1 -Force
+Import-Module $PSScriptRoot\..\ShowMarkdown.psm1 -Force
 
 # ─────────────────────────────────────────────────────────────
 # Embedded minimal client (no module dependency)

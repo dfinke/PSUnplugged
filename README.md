@@ -22,12 +22,22 @@ And because the Codex App Server is provider-agnostic, so is PSUnplugged. Point 
 
 ## What's Inside
 
+```
+PSUnplugged.psm1          # module — session, threads, turns, JSON-RPC
+PSUnplugged.psd1          # module manifest (PowerShell Gallery ready)
+ShowMarkdown.psm1         # terminal Markdown renderer
+Examples/
+  Start-AgentChat.ps1    # interactive REPL — multi-turn chat, streaming, slash commands
+  QuickStart.ps1         # working examples for every feature
+```
+
 | File | What it does |
 |---|---|
-| `CodexAppServer.psm1` | Full PowerShell module — session management, threads, turns, low-level JSON-RPC |
-| `Chat-Codex.ps1` | Interactive REPL — multi-turn chat, streaming, slash commands |
+| `PSUnplugged.psm1` | Full PowerShell module — session management, threads, turns, low-level JSON-RPC |
+| `PSUnplugged.psd1` | Module manifest — version, author, tags, Gallery metadata |
+| `Examples/Start-AgentChat.ps1` | Interactive REPL — multi-turn chat, streaming, slash commands |
+| `Examples/QuickStart.ps1` | Working examples for every feature |
 | `ShowMarkdown.psm1` | Terminal Markdown renderer — headers, code blocks, tables with box-drawing chars |
-| `QuickStart.ps1` | Working examples for every feature |
 
 ---
 
@@ -35,21 +45,41 @@ And because the Codex App Server is provider-agnostic, so is PSUnplugged. Point 
 
 **Prerequisites**
 
-```powershell
-npm i -g @openai/codex
-codex login   # authenticate once
-```
+1. **Node.js 18+** — [nodejs.org](https://nodejs.org) (provides `npm`)
+2. **PowerShell 7+** — [aka.ms/powershell](https://aka.ms/powershell) (Windows ships with 5.1; this module requires 7)
+3. **Codex CLI**
+   ```powershell
+   npm i -g @openai/codex
+   ```
+4. **Authenticate** — runs interactively on first use; have your OpenAI API key ready:
+   ```powershell
+   codex login
+   ```
+   Or skip login and pass your key directly at runtime:
+   ```powershell
+   $session = Start-CodexSession -ApiKey $env:OPENAI_API_KEY
+   ```
+5. **Clone this repo**
+   ```powershell
+   git clone https://github.com/dfinke/PSUnplugged
+   cd PSUnplugged
+   ```
+
+> **Windows tip:** If `Start-CodexSession` can't find the binary, set `$env:CODEX_EXE` to the full path of `codex.exe`:
+> ```powershell
+> $env:CODEX_EXE = (Get-ChildItem (npm root -g) -Recurse -Filter codex.exe | Where-Object { $_.Length -gt 1MB } | Select-Object -First 1).FullName
+> ```
 
 **Interactive chat**
 
 ```powershell
-.\Chat-Codex.ps1
+.\Examples\Start-AgentChat.ps1
 ```
 
 **One-liner from a script**
 
 ```powershell
-Import-Module .\CodexAppServer.psm1
+Import-Module .\PSUnplugged.psm1
 
 $session = Start-CodexSession
 $answer  = Invoke-CodexQuestion -Session $session -Text "What does this repo do?"
@@ -147,6 +177,8 @@ PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the clo
 **Read/write mode** — the agent can execute commands, modify files, and take action in your repo. Includes an approval flow so nothing runs without your sign-off. Dropping at launch of AI Agent Forge.
 
 **MCP support** — local and remote servers, drop-in config. The model sees them as callable tools. Web search, databases, custom APIs — no extra client code needed.
+
+**Much more** — PSUnplugged is just the client. The real magic is in the Codex App Server, and we're just getting started. Expect rapid iteration, new features, and a lot of surprises.
 
 **[Join the AI Agent Forge waitlist →](https://forms.gle/gvw8cU2pgFeXWMNZA)**
 
