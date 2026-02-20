@@ -15,6 +15,7 @@
     Usage:
       .\Examples\Start-AgentChat.ps1
       .\Examples\Start-AgentChat.ps1 -Model "gpt-5.1-codex" -Cwd "D:\myproject"
+      .\Examples\Start-AgentChat.ps1 -Model "gpt-4.1" -ApiKey $env:OPENAI_API_KEY
 
     Commands inside the chat:
       /quit, /exit, /q   - end the session
@@ -26,7 +27,8 @@
 param(
     [string]$Model = "gpt-5.1-codex",
     [string]$Cwd = (Get-Location).Path,
-    [string]$CodexExe = $env:CODEX_EXE
+    [string]$CodexExe = $env:CODEX_EXE,
+    [string]$ApiKey
 )
 
 
@@ -200,6 +202,18 @@ $initResult = Send-Request -Writer $w -Reader $r -Method "initialize" -Params @{
 }
 Send-Notification -Writer $w -Method "initialized"
 
+# Log in with API key if provided (overrides any stored ChatGPT account auth)
+if ($ApiKey) {
+    Send-Request -Writer $w -Reader $r -Method "account/login/start" -Params @{
+        type   = "apiKey"
+        apiKey = $ApiKey
+    } | Out-Null
+    # Drain login/completed and account/updated notifications
+    $r.ReadLine() | Out-Null
+    $r.ReadLine() | Out-Null
+    Write-Host "  Auth:    API key" -ForegroundColor DarkGray
+}
+
 Write-Host "  Connected!" -ForegroundColor Green
 Write-Host ""
 
@@ -243,8 +257,10 @@ while ($true) {
             continue
         }
         '^/model\s+(.+)$' {
-            $Model = $Matches[1]
-            Write-Host "  [Model switched to $Model]" -ForegroundColor DarkCyan
+            $script:Model = $Matches[1]
+            $threadId = Start-NewThread
+            $turnCount = 0
+            Write-Host "  [Model switched to $($script:Model), new thread started]" -ForegroundColor DarkCyan
             continue
         }
         '^/verbose$' {
