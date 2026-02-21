@@ -194,18 +194,18 @@ PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the clo
 
 ## Coming Next
 
-**Read/write mode** — the agent can execute commands, modify files, and take action in your repo. Includes an approval flow so nothing runs without your sign-off. Dropping at launch of AI Agent Forge.
+**Read/write mode** — the agent can execute commands, modify files, and take action in your repo. Includes an approval flow so nothing runs without your sign-off. Dropping at launch of [AI Agent Forge](https://forms.gle/gvw8cU2pgFeXWMNZA).
 
 **MCP support** — local and remote servers, drop-in config. The model sees them as callable tools. Web search, databases, custom APIs — no extra client code needed.
 
 **Much more** — PSUnplugged is just the client. The real magic is in the Codex App Server, and we're just getting started. Expect rapid iteration, new features, and a lot of surprises.
 
-**[Join the AI Agent Forge waitlist →](https://forms.gle/gvw8cU2pgFeXWMNZA)**
+**[Join the AI Agent Forge waitlist](https://forms.gle/gvw8cU2pgFeXWMNZA)**
 
 ---
 
 ## Known Limitations
-- Currently read-only (no file writes or command execution — approval flow coming soon via AI Agent Forge)
+- Currently read-only (no file writes or command execution — approval flow coming soon via [AI Agent Forge](https://forms.gle/gvw8cU2pgFeXWMNZA))
 - Tested primarily with OpenAI-hosted Codex models (gpt-5.1-codex via ChatGPT login, or API key for others)
 - Multi-provider support (Ollama, xAI, etc.) is experimental and requires manual config.toml tweaks — not documented here yet
 
