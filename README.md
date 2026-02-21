@@ -1,4 +1,9 @@
 # PSUnplugged
+<br/>
+<div align="center">
+  <img src="media/image.png" alt="alt text" width="60%">
+</div>
+<br/>
 
 > The IDE had a good run. PowerShell agentic AI, unplugged.
 
@@ -198,6 +203,11 @@ PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the clo
 **[Join the AI Agent Forge waitlist →](https://forms.gle/gvw8cU2pgFeXWMNZA)**
 
 ---
+
+## Known Limitations
+- Currently read-only (no file writes or command execution — approval flow coming soon via AI Agent Forge)
+- Tested primarily with OpenAI-hosted Codex models (gpt-5.1-codex via ChatGPT login, or API key for others)
+- Multi-provider support (Ollama, xAI, etc.) is experimental and requires manual config.toml tweaks — not documented here yet
 
 ## Built With
 
