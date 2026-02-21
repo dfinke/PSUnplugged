@@ -1,7 +1,7 @@
 # PSUnplugged
 <br/>
 <div align="center">
-  <img src="media/PSUnplugged.png" alt="alt text" width="60%">
+  <img src="media/PSUnplugged.png" alt="alt text" width="45%">
 </div>
 <br/>
 
