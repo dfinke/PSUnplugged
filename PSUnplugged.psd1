@@ -9,19 +9,19 @@
     PowerShellVersion = '7.0'
 
     FunctionsToExport = @(
+        'Get-CodexAccount'
+        'Get-CodexModels'
+        'Get-CodexThreads'
+        'Invoke-CodexCommand'
+        'Invoke-CodexQuestion'
+        'Invoke-CodexTurn'
+        'New-CodexThread'
+        'Read-CodexNotifications'
+        'Resume-CodexThread'
+        'Send-CodexNotification'
+        'Send-CodexRequest'
         'Start-CodexSession'
         'Stop-CodexSession'
-        'New-CodexThread'
-        'Resume-CodexThread'
-        'Invoke-CodexTurn'
-        'Invoke-CodexQuestion'
-        'Get-CodexThreads'
-        'Get-CodexModels'
-        'Invoke-CodexCommand'
-        'Get-CodexAccount'
-        'Send-CodexRequest'
-        'Send-CodexNotification'
-        'Read-CodexNotifications'
     )
 
     CmdletsToExport   = @()
