@@ -118,6 +118,22 @@ Stop-CodexSession -Session $session
 /quit        exit
 ```
 
+**Thread settings used by `Start-AgentChat.ps1`**
+
+The interactive example starts each thread with these Codex App Server settings:
+
+- `approvalPolicy = "never"`
+  - Do not pause for approval prompts.
+  - Other supported values in this module are `on-request` and `unless-trusted`.
+- `sandbox = "workspace-write"`
+  - Use the workspace-write sandbox mode for the thread.
+  - Other supported values in this module are `read-only` and `danger-full-access`.
+
+These values are also exposed by `New-CodexThread` in `PSUnplugged.psm1` as:
+
+- `-ApprovalPolicy`
+- `-SandboxType`
+
 ---
 
 <!-- Provider-Agnostic section under review — wire_api compat being validated across providers

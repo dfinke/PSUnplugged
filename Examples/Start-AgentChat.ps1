@@ -14,6 +14,7 @@
 
     Usage:
       .\Examples\Start-AgentChat.ps1
+        .\Examples\Start-AgentChat.ps1 -Verbose
       .\Examples\Start-AgentChat.ps1 -Model "gpt-5.1-codex" -Cwd "D:\myproject"
       .\Examples\Start-AgentChat.ps1 -Model "gpt-4.1" -ApiKey $env:OPENAI_API_KEY
 
@@ -24,6 +25,7 @@
       /verbose           - toggle verbose JSON-RPC output
 #>
 
+[CmdletBinding()]
 param(
     [string]$Model = "gpt-5.1-codex",
     [string]$Cwd = (Get-Location).Path,
@@ -40,6 +42,8 @@ Import-Module $PSScriptRoot\..\ShowMarkdown.psm1 -Force
 
 $script:Verbose = $false
 $script:NextId = 1
+$script:ApprovalPolicy = "never"
+$script:Sandbox = "workspace-write"
 
 function Find-CodexBinary {
     param([string]$Hint)
@@ -171,6 +175,9 @@ Write-Host "  Binary:  $binary" -ForegroundColor DarkGray
 Write-Host "  Model:   $Model" -ForegroundColor DarkGray
 Write-Host "  Cwd:     $Cwd" -ForegroundColor DarkGray
 Write-Host "  Commands: /quit /new /model <name> /verbose" -ForegroundColor DarkGray
+if ($VerbosePreference -ne [System.Management.Automation.ActionPreference]::SilentlyContinue) {
+    Write-Host "  Thread:  approvalPolicy=$($script:ApprovalPolicy), sandbox=$($script:Sandbox)" -ForegroundColor DarkGray
+}
 Write-Host ""
 
 # Launch app-server
@@ -221,8 +228,8 @@ Write-Host ""
 function Start-NewThread {
     $result = Send-Request -Writer $w -Reader $r -Method "thread/start" -Params @{
         model          = $script:Model
-        approvalPolicy = "never"
-        sandbox        = "workspace-write"
+        approvalPolicy = $script:ApprovalPolicy
+        sandbox        = $script:Sandbox
         cwd            = $script:Cwd
     }
     # Drain thread/started and mcp_startup_complete notifications
