@@ -31,6 +31,9 @@ And because the Codex App Server is provider-agnostic, so is PSUnplugged. Point 
 PSUnplugged.psm1          # module — session, threads, turns, JSON-RPC
 PSUnplugged.psd1          # module manifest (PowerShell Gallery ready)
 ShowMarkdown.psm1         # terminal Markdown renderer
+Threads/
+  README.md               # project-aware thread/project UX and usage
+  PSUnplugged.Threads.psm1 # higher-level project/thread catalog commands
 Examples/
   Start-AgentChat.ps1    # interactive REPL — multi-turn chat, streaming, slash commands
   QuickStart.ps1         # working examples for every feature
@@ -40,6 +43,8 @@ Examples/
 |---|---|
 | `PSUnplugged.psm1` | Full PowerShell module — session management, threads, turns, low-level JSON-RPC |
 | `PSUnplugged.psd1` | Module manifest — version, author, tags, Gallery metadata |
+| `Threads/PSUnplugged.Threads.psm1` | Higher-level thread and project catalog commands |
+| `Threads/README.md` | Usage guide for project-aware thread management |
 | `Examples/Start-AgentChat.ps1` | Interactive REPL — multi-turn chat, streaming, slash commands |
 | `Examples/QuickStart.ps1` | Working examples for every feature |
 | `ShowMarkdown.psm1` | Terminal Markdown renderer — headers, code blocks, tables with box-drawing chars |
