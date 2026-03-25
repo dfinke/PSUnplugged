@@ -17,12 +17,14 @@
         .\Examples\Start-AgentChat.ps1 -Verbose
       .\Examples\Start-AgentChat.ps1 -Model "gpt-5.1-codex" -Cwd "D:\myproject"
       .\Examples\Start-AgentChat.ps1 -Model "gpt-4.1" -ApiKey $env:OPENAI_API_KEY
+      .\Examples\Start-AgentChat.ps1 -ThreadId "<existing-thread-id>"
 
     Commands inside the chat:
       /quit, /exit, /q   - end the session
       /new               - start a fresh thread
       /model <name>      - switch model
       /verbose           - toggle verbose JSON-RPC output
+      /thread            - show the current thread id
 #>
 
 [CmdletBinding()]
@@ -30,7 +32,8 @@ param(
     [string]$Model = "gpt-5.1-codex",
     [string]$Cwd = (Get-Location).Path,
     [string]$CodexExe = $env:CODEX_EXE,
-    [string]$ApiKey
+    [string]$ApiKey,
+    [string]$ThreadId
 )
 
 
@@ -174,7 +177,7 @@ Write-Host "╚═════════════════════�
 Write-Host "  Binary:  $binary" -ForegroundColor DarkGray
 Write-Host "  Model:   $Model" -ForegroundColor DarkGray
 Write-Host "  Cwd:     $Cwd" -ForegroundColor DarkGray
-Write-Host "  Commands: /quit /new /model <name> /verbose" -ForegroundColor DarkGray
+Write-Host "  Commands: /quit /new /model <name> /verbose /thread" -ForegroundColor DarkGray
 if ($VerbosePreference -ne [System.Management.Automation.ActionPreference]::SilentlyContinue) {
     Write-Host "  Thread:  approvalPolicy=$($script:ApprovalPolicy), sandbox=$($script:Sandbox)" -ForegroundColor DarkGray
 }
@@ -239,8 +242,19 @@ function Start-NewThread {
     return $result.thread.id
 }
 
-$threadId = Start-NewThread
+function Resume-Thread {
+    param([Parameter(Mandatory)][string]$Id)
+
+    $result = Send-Request -Writer $w -Reader $r -Method "thread/resume" -Params @{
+        threadId = $Id
+    }
+
+    return $result.thread.id
+}
+
+$threadId = if ($ThreadId) { Resume-Thread -Id $ThreadId } else { Start-NewThread }
 $turnCount = 0
+Write-Host "  Thread:  $threadId" -ForegroundColor DarkGray
 
 # Chat loop
 while ($true) {
@@ -273,6 +287,10 @@ while ($true) {
         '^/verbose$' {
             $script:Verbose = -not $script:Verbose
             Write-Host "  [Verbose: $($script:Verbose)]" -ForegroundColor DarkCyan
+            continue
+        }
+        '^/thread$' {
+            Write-Host "  [Thread: $threadId]" -ForegroundColor DarkCyan
             continue
         }
     }
