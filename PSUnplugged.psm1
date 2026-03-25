@@ -37,6 +37,17 @@
     Stop-CodexSession -Session $session
 #>
 
+# Load the higher-level thread/project helpers before public functions are defined.
+$threadModulePath = Join-Path $PSScriptRoot 'Threads\PSUnplugged.Threads.psm1'
+if (Test-Path -LiteralPath $threadModulePath) {
+    Import-Module -Name $threadModulePath -Scope Local -DisableNameChecking -Force
+}
+
+$threadFormatPath = Join-Path $PSScriptRoot 'Threads\PSUnplugged.Threads.Format.ps1xml'
+if (Test-Path -LiteralPath $threadFormatPath) {
+    Update-FormatData -PrependPath $threadFormatPath -ErrorAction SilentlyContinue
+}
+
 # ─────────────────────────────────────────────────────────────
 # Session management
 # ─────────────────────────────────────────────────────────────
@@ -389,29 +400,110 @@ function New-CodexThread {
         When to pause for approval: never, on-request, unless-trusted.
     .PARAMETER SandboxType
         Sandbox policy: read-only, workspace-write, danger-full-access.
+    .PARAMETER Prompt
+        Optional first prompt to send after the thread is created.
+    .PARAMETER Name
+        Optional local display name used by the PowerShell thread catalog.
+    .PARAMETER Tags
+        Optional local tags used by the PowerShell thread catalog.
+    .PARAMETER PassThruSession
+        Keeps an auto-created session open and returns it on the thread object.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][PSCustomObject]$Session,
+        [PSCustomObject]$Session,
         [string]$Model = "gpt-5.1-codex",
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]
+        $InputObject,
+        [Alias('Path')]
         [string]$Cwd,
         [string]$ApprovalPolicy = "never",
         [ValidateSet("read-only", "workspace-write", "danger-full-access")]
-        [string]$SandboxType = "workspace-write"
+        [string]$SandboxType = "workspace-write",
+        [Parameter(Position = 0)]
+        [string]$Prompt,
+        [string]$Name,
+        [string[]]$Tags,
+        [switch]$PassThruSession
     )
 
-    $params = @{
-        model          = $Model
-        approvalPolicy = $ApprovalPolicy
-        sandbox        = $SandboxType
+    process {
+        $effectiveCwd = $Cwd
+        if ([string]::IsNullOrWhiteSpace($effectiveCwd) -and $null -ne $InputObject) {
+            if ($InputObject -is [string]) {
+                $effectiveCwd = [string]$InputObject
+            }
+            elseif ($InputObject.PSObject) {
+                foreach ($propertyName in 'Path', 'path', 'ProjectPath', 'projectPath', 'Cwd', 'cwd') {
+                    $property = $InputObject.PSObject.Properties[$propertyName]
+                    if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                        $effectiveCwd = [string]$property.Value
+                        break
+                    }
+                }
+            }
+        }
+
+        $managedParams = @{}
+        foreach ($entry in $PSBoundParameters.GetEnumerator()) {
+            if ($entry.Key -eq 'InputObject') {
+                continue
+            }
+
+            $managedParams[$entry.Key] = $entry.Value
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($effectiveCwd)) {
+            $managedParams.Cwd = $effectiveCwd
+        }
+        elseif ($managedParams.ContainsKey('Cwd')) {
+            $managedParams.Remove('Cwd')
+        }
+
+        $useManagedMode =
+            $managedParams.ContainsKey('Prompt') -or
+            $managedParams.ContainsKey('Name') -or
+            $managedParams.ContainsKey('Tags') -or
+            $PassThruSession -or
+            ($null -ne $InputObject) -or
+            -not $managedParams.ContainsKey('Session')
+
+        if ($useManagedMode) {
+            New-PSUnpluggedManagedThread @managedParams
+        }
+        else {
+            $params = @{
+                model          = $Model
+                approvalPolicy = $ApprovalPolicy
+                sandbox        = $SandboxType
+            }
+            if ($effectiveCwd) { $params.cwd = $effectiveCwd }
+
+            $result = Send-CodexRequest -Session $Session -Method "thread/start" -Params $params
+            # Drain the thread/started notification
+            Read-CodexNotifications -Session $Session -TimeoutMs 1000 | Out-Null
+
+            $result.thread
+        }
     }
-    if ($Cwd) { $params.cwd = $Cwd }
+}
 
-    $result = Send-CodexRequest -Session $Session -Method "thread/start" -Params $params
-    # Drain the thread/started notification
-    Read-CodexNotifications -Session $Session -TimeoutMs 1000 | Out-Null
+function New-PlaygroundProject {
+    <#
+    .SYNOPSIS
+        Creates a new playground project with a shorter, pipeline-friendly name.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Name,
+        [string]$ParentPath
+    )
 
-    return $result.thread
+    if ($PSBoundParameters.ContainsKey('ParentPath')) {
+        return (New-CodexPlaygroundProject -Name $Name -ParentPath $ParentPath)
+    }
+
+    return (New-CodexPlaygroundProject -Name $Name)
 }
 
 function Resume-CodexThread {
@@ -589,10 +681,20 @@ Export-ModuleMember -Function @(
     'Start-CodexSession'
     'Stop-CodexSession'
     'New-CodexThread'
+    'Get-CodexThread'
+    'Get-CodexTranscript'
+    'Show-CodexTranscript'
+    'Set-CodexThread'
+    'Remove-CodexThread'
+    'Enter-CodexThread'
     'Resume-CodexThread'
     'Invoke-CodexTurn'
     'Invoke-CodexQuestion'
     'Get-CodexThreads'
+    'Get-CodexProject'
+    'New-CodexProject'
+    'New-PlaygroundProject'
+    'New-CodexPlaygroundProject'
     'Get-CodexModels'
     'Invoke-CodexCommand'
     'Get-CodexAccount'
