@@ -11,17 +11,31 @@
     FunctionsToExport = @(
         'Get-CodexAccount'
         'Get-CodexModels'
+        'Get-CodexProject'
+        'Get-CodexThread'
+        'Get-CodexTranscript'
         'Get-CodexThreads'
+        'Show-CodexTranscript'
+        'Enter-CodexThread'
         'Invoke-CodexCommand'
         'Invoke-CodexQuestion'
         'Invoke-CodexTurn'
+        'New-CodexPlaygroundProject'
+        'New-CodexProject'
+        'New-PlaygroundProject'
         'New-CodexThread'
         'Read-CodexNotifications'
+        'Remove-CodexThread'
         'Resume-CodexThread'
+        'Set-CodexThread'
         'Send-CodexNotification'
         'Send-CodexRequest'
         'Start-CodexSession'
         'Stop-CodexSession'
+    )
+
+    FormatsToProcess  = @(
+        'Threads/PSUnplugged.Threads.Format.ps1xml'
     )
 
     CmdletsToExport   = @()
