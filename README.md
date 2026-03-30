@@ -1,4 +1,7 @@
 # PSUnplugged
+[![](https://img.shields.io/twitter/follow/dfinke.svg?style=social&label=Follow%20%40dfinke)](https://x.com/dfinke)
+[![](https://img.shields.io/youtube/channel/subscribers/UCP47ZkO5EDkoI2sr-3P4ShQ)](https://youtube.com/@dougfinke)
+
 <br/>
 <div align="center">
   <img src="media/PSUnplugged.png" alt="alt text" width="45%">
@@ -11,7 +14,25 @@ A terminal-native agentic client for the [OpenAI Codex App Server](https://githu
 
 Just PowerShell.
 
+<!--
+
+PSUnplugged brings agentic AI directly into your terminal — no IDE, no extensions, no GUI. It's a PowerShell-native client for the OpenAI Codex App Server, giving you multi-turn conversations, streaming responses, and full Markdown rendering right where you already work: the command line.
+
+This is PowerShell as it was always meant to be used — not as a side panel in someone else's editor, but as the runtime itself. PSUnplugged is the bridge between the shell you know and the agentic future that's already here.
+
+ -->
+
 > **This release is read-only.** The agent can read files, answer questions, and reason about your code — but won't write or execute anything. Read/write mode with approval flow is coming in [AI Agent Forge](https://forms.gle/gvw8cU2pgFeXWMNZA).
+
+---
+
+## 🚀 Join the AI Agent Forge Community
+
+**PSUnplugged is the beginning.** The next phase — read/write mode, approval flows, MCP tool integration, and a full agentic workflow engine — is launching through **[AI Agent Forge](https://forms.gle/gvw8cU2pgFeXWMNZA)**.
+
+AI Agent Forge is a community for PowerShell developers stepping into the agentic AI era. Early members get first access to new capabilities as they ship, direct input into the roadmap, and a front-row seat to what's coming next.
+
+👉 **[Join the waitlist](https://forms.gle/gvw8cU2pgFeXWMNZA)**
 
 ---
 
@@ -31,6 +52,9 @@ And because the Codex App Server is provider-agnostic, so is PSUnplugged. Point 
 PSUnplugged.psm1          # module — session, threads, turns, JSON-RPC
 PSUnplugged.psd1          # module manifest (PowerShell Gallery ready)
 ShowMarkdown.psm1         # terminal Markdown renderer
+Threads/
+  README.md               # project-aware thread/project UX and usage
+  PSUnplugged.Threads.psm1 # higher-level project/thread catalog commands
 Examples/
   Start-AgentChat.ps1    # interactive REPL — multi-turn chat, streaming, slash commands
   QuickStart.ps1         # working examples for every feature
@@ -40,6 +64,8 @@ Examples/
 |---|---|
 | `PSUnplugged.psm1` | Full PowerShell module — session management, threads, turns, low-level JSON-RPC |
 | `PSUnplugged.psd1` | Module manifest — version, author, tags, Gallery metadata |
+| `Threads/PSUnplugged.Threads.psm1` | Higher-level thread and project catalog commands |
+| `Threads/README.md` | Usage guide for project-aware thread management |
 | `Examples/Start-AgentChat.ps1` | Interactive REPL — multi-turn chat, streaming, slash commands |
 | `Examples/QuickStart.ps1` | Working examples for every feature |
 | `ShowMarkdown.psm1` | Terminal Markdown renderer — headers, code blocks, tables with box-drawing chars |
