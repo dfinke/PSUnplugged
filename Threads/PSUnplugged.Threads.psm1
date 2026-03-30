@@ -11,7 +11,7 @@ if (-not (Get-Command Start-CodexSession -CommandType Function -ErrorAction Sile
         param(
             [string]$ClientName = "powershell_client",
             [string]$ClientTitle = "PowerShell Codex Client",
-            [string]$Version = "0.1.0",
+            [string]$Version = "0.1.1",
             [string]$ApiKey,
             [string]$CodexPath = "codex"
         )
