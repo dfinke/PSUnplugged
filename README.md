@@ -8,11 +8,8 @@
 </div>
 <br/>
 
-> The IDE had a good run. PowerShell agentic AI, unplugged.
+**PSUnplugged is a PowerShell orchestration shell for OpenAI’s Codex App Server. It gives PowerShell users a terminal-native way to drive the Codex runtime while inheriting native support for conversation history, approvals, streamed agent events, AGENTS.md, MCP servers, skills, and plugins. Instead of rebuilding an agent stack from scratch, PSUnplugged makes PowerShell the control surface for reasoning, execution, and automation.**
 
-A terminal-native agentic client for the [OpenAI Codex App Server](https://github.com/openai/codex). Multi-turn conversations, streaming responses, full Markdown rendered in your terminal. No VS Code. No extensions. No GUI.
-
-Just PowerShell.
 
 <!--
 
