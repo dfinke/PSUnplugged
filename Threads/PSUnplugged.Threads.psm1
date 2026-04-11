@@ -5,7 +5,7 @@ if (Test-Path -LiteralPath $threadFormatPath) {
     Update-FormatData -PrependPath $threadFormatPath -ErrorAction SilentlyContinue
 }
 
-if (-not (Get-Command Start-CodexSession -CommandType Function -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ErrorAction Ignore)) {
     function Start-CodexSession {
         [CmdletBinding()]
         param(
@@ -741,6 +741,251 @@ function New-CodexTranscriptItem {
     return $item
 }
 
+function Test-CodexTelemetryTypeEnabled {
+    [CmdletBinding()]
+    param(
+        [string[]]$TelemetryType,
+        [Parameter(Mandatory)][string]$Type
+    )
+
+    $normalizedType = $Type.Trim().ToLowerInvariant()
+    foreach ($entry in @($TelemetryType)) {
+        if ([string]::IsNullOrWhiteSpace($entry)) {
+            continue
+        }
+
+        $normalizedEntry = $entry.Trim().ToLowerInvariant()
+        if ($normalizedEntry -eq 'all' -or $normalizedEntry -eq $normalizedType) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function ConvertTo-CodexTelemetryArgumentObject {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Arguments
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Arguments)) {
+        return $null
+    }
+
+    try {
+        return ($Arguments | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function ConvertTo-CodexTelemetryValueText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Value,
+        [int]$MaxLength = 72
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        (@($Value) | ForEach-Object { [string]$_ }) -join ' '
+    }
+    else {
+        [string]$Value
+    }
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    $text = (($text -replace '\s+', ' ').Trim())
+    if ($text.Length -gt $MaxLength) {
+        return ($text.Substring(0, $MaxLength - 3) + '...')
+    }
+
+    return $text
+}
+
+function Get-CodexTelemetryDisplayName {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $null
+    }
+
+    if ($Name -eq 'shell_command') {
+        return 'shell'
+    }
+
+    if ($Name -match '^mcp__codex_apps__([^_]+)_(.+)$') {
+        return ('{0}.{1}' -f $matches[1], $matches[2])
+    }
+
+    return $Name
+}
+
+function Get-CodexTelemetryArgumentSummary {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Arguments,
+        [string[]]$PreferKey = @(),
+        [int]$MaxItems = 2
+    )
+
+    $argumentObject = ConvertTo-CodexTelemetryArgumentObject -Arguments $Arguments
+    if ($null -eq $argumentObject -or -not $argumentObject.PSObject) {
+        return (ConvertTo-CodexTelemetryValueText -Value $Arguments -MaxLength 80)
+    }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($propertyName in @($PreferKey)) {
+        $property = $argumentObject.PSObject.Properties[$propertyName]
+        if ($property) {
+            $valueText = ConvertTo-CodexTelemetryValueText -Value $property.Value
+            if (-not [string]::IsNullOrWhiteSpace($valueText)) {
+                $parts.Add(('{0}={1}' -f $property.Name, $valueText))
+                $null = $seen.Add($property.Name)
+            }
+        }
+
+        if ($parts.Count -ge $MaxItems) {
+            break
+        }
+    }
+
+    if ($parts.Count -lt $MaxItems) {
+        foreach ($property in @($argumentObject.PSObject.Properties)) {
+            if ($parts.Count -ge $MaxItems) {
+                break
+            }
+
+            if ($seen.Contains($property.Name)) {
+                continue
+            }
+
+            $valueText = ConvertTo-CodexTelemetryValueText -Value $property.Value
+            if (-not [string]::IsNullOrWhiteSpace($valueText)) {
+                $parts.Add(('{0}={1}' -f $property.Name, $valueText))
+            }
+        }
+    }
+
+    return ($parts -join ', ')
+}
+
+function Get-CodexShellCommandSummary {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Arguments
+    )
+
+    $argumentObject = ConvertTo-CodexTelemetryArgumentObject -Arguments $Arguments
+    $commandText = [string](Get-CodexFirstValue -InputObject $argumentObject -PropertyName @('command', 'Command'))
+    if ([string]::IsNullOrWhiteSpace($commandText)) {
+        return (ConvertTo-CodexTelemetryValueText -Value $Arguments -MaxLength 90)
+    }
+
+    return (ConvertTo-CodexTelemetryValueText -Value $commandText -MaxLength 90)
+}
+
+function Get-CodexShellCommandResultSummary {
+    [CmdletBinding()]
+    param(
+        [string]$CommandSummary,
+        [AllowNull()][string]$Output
+    )
+
+    $exitCode = $null
+    $wallTime = $null
+    $timedOut = $false
+
+    if (-not [string]::IsNullOrWhiteSpace($Output)) {
+        $exitMatch = [regex]::Match($Output, 'Exit code:\s*(-?\d+)')
+        if ($exitMatch.Success) {
+            $exitCode = $exitMatch.Groups[1].Value
+        }
+
+        $wallMatch = [regex]::Match($Output, 'Wall time:\s*([^\r\n]+)')
+        if ($wallMatch.Success) {
+            $wallTime = $wallMatch.Groups[1].Value.Trim()
+        }
+
+        if ($Output -match 'command timed out after') {
+            $timedOut = $true
+        }
+    }
+
+    $statusText = if ($timedOut) {
+        'Timed out'
+    }
+    elseif ($exitCode -eq '0') {
+        'Completed'
+    }
+    elseif ($exitCode) {
+        'Failed'
+    }
+    else {
+        'Finished'
+    }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add($statusText)
+    if (-not [string]::IsNullOrWhiteSpace($CommandSummary)) {
+        $parts.Add($CommandSummary)
+    }
+
+    $suffix = [System.Collections.Generic.List[string]]::new()
+    if ($exitCode) {
+        $suffix.Add("exit $exitCode")
+    }
+    if ($wallTime) {
+        $suffix.Add($wallTime)
+    }
+
+    if ($suffix.Count -gt 0) {
+        return ('{0} ({1})' -f ($parts -join ': '), ($suffix -join ', '))
+    }
+
+    return ($parts -join ': ')
+}
+
+function Get-CodexToolCallSummary {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Name,
+        [AllowNull()][string]$Arguments
+    )
+
+    $displayName = Get-CodexTelemetryDisplayName -Name $Name
+    $argumentSummary = Get-CodexTelemetryArgumentSummary -Arguments $Arguments -PreferKey @(
+        'issue_number',
+        'pr_number',
+        'repo',
+        'repo_full_name',
+        'repository_full_name',
+        'query',
+        'path',
+        'branch_name',
+        'name'
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($argumentSummary)) {
+        return ('{0} {1}' -f $displayName, $argumentSummary)
+    }
+
+    return $displayName
+}
+
 function ConvertTo-CodexTranscriptItemsFromThreadRecord {
     [CmdletBinding()]
     param(
@@ -801,7 +1046,8 @@ function ConvertTo-CodexTranscriptItemsFromSessionFile {
         [Parameter(Mandatory)][string]$Path,
         [string]$ThreadId,
         [string]$ThreadName,
-        [string]$Project
+        [string]$Project,
+        [string[]]$TelemetryType
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -810,6 +1056,7 @@ function ConvertTo-CodexTranscriptItemsFromSessionFile {
 
     $items = [System.Collections.Generic.List[object]]::new()
     $seenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $callMetadata = @{}
     $currentTurnId = $null
     $resolvedThreadId = $ThreadId
     $index = 0
@@ -858,6 +1105,69 @@ function ConvertTo-CodexTranscriptItemsFromSessionFile {
             $itemType = 'agentMessage'
             $phase = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('phase', 'Phase'))
             $text = Get-CodexTranscriptText -InputObject $entry.payload
+        }
+        elseif ($entry.type -eq 'event_msg' -and $entry.payload.type -eq 'task_complete') {
+            $role = 'assistant'
+            $itemType = 'agentMessage'
+            $phase = 'final_answer'
+            $text = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('last_agent_message', 'lastAgentMessage'))
+        }
+        elseif ($entry.type -eq 'event_msg' -and $entry.payload.type -eq 'agent_reasoning' -and (Test-CodexTelemetryTypeEnabled -TelemetryType $TelemetryType -Type 'reasoning')) {
+            $role = 'assistant'
+            $itemType = 'agentReasoning'
+            $phase = 'reasoning'
+            $text = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('text', 'Text'))
+        }
+        elseif ($entry.type -eq 'response_item' -and $entry.payload.type -eq 'function_call') {
+            $callId = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('call_id', 'callId'))
+            $callName = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('name', 'Name'))
+            $callArguments = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('arguments', 'Arguments'))
+
+            if ($callName -eq 'shell_command' -and (Test-CodexTelemetryTypeEnabled -TelemetryType $TelemetryType -Type 'commands')) {
+                $commandSummary = Get-CodexShellCommandSummary -Arguments $callArguments
+                if (-not [string]::IsNullOrWhiteSpace($callId)) {
+                    $callMetadata[$callId] = @{
+                        Kind    = 'command'
+                        Summary = $commandSummary
+                    }
+                }
+
+                $role = 'assistant'
+                $itemType = 'command'
+                $phase = 'command'
+                $text = if (-not [string]::IsNullOrWhiteSpace($commandSummary)) {
+                    "Running: $commandSummary"
+                }
+                else {
+                    'Running command'
+                }
+            }
+            elseif ($callName -ne 'shell_command' -and (Test-CodexTelemetryTypeEnabled -TelemetryType $TelemetryType -Type 'tools')) {
+                $toolSummary = Get-CodexToolCallSummary -Name $callName -Arguments $callArguments
+                if (-not [string]::IsNullOrWhiteSpace($callId)) {
+                    $callMetadata[$callId] = @{
+                        Kind    = 'tool'
+                        Summary = $toolSummary
+                    }
+                }
+
+                $role = 'assistant'
+                $itemType = 'toolCall'
+                $phase = 'tool'
+                $text = $toolSummary
+            }
+        }
+        elseif ($entry.type -eq 'response_item' -and $entry.payload.type -eq 'function_call_output') {
+            $callId = [string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('call_id', 'callId'))
+            if (-not [string]::IsNullOrWhiteSpace($callId) -and $callMetadata.ContainsKey($callId)) {
+                $callInfo = $callMetadata[$callId]
+                if ($callInfo.Kind -eq 'command' -and (Test-CodexTelemetryTypeEnabled -TelemetryType $TelemetryType -Type 'commands')) {
+                    $role = 'assistant'
+                    $itemType = 'command'
+                    $phase = 'command'
+                    $text = Get-CodexShellCommandResultSummary -CommandSummary ([string]$callInfo.Summary) -Output ([string](Get-CodexFirstValue -InputObject $entry.payload -PropertyName @('output', 'Output')))
+                }
+            }
         }
 
         if ([string]::IsNullOrWhiteSpace($role) -or [string]::IsNullOrWhiteSpace($text)) {
@@ -1892,18 +2202,20 @@ function ConvertTo-CodexThreadOutput {
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($projectKey) -and $path) {
-        $projectIdentity = Get-CodexProjectIdentity -Path $path
-        $projectKey = $projectIdentity.ProjectKey
-        $projectName = $projectIdentity.Name
-    }
-    elseif ($path -and -not $projectRecord -and -not $Record) {
-        $projectIdentity = Get-CodexProjectIdentity -Path $path
+    if ($path -and (Test-Path -LiteralPath $path)) {
         if ([string]::IsNullOrWhiteSpace($projectKey)) {
+            $projectIdentity = Get-CodexProjectIdentity -Path $path
             $projectKey = $projectIdentity.ProjectKey
-        }
-        if ([string]::IsNullOrWhiteSpace($projectName)) {
             $projectName = $projectIdentity.Name
+        }
+        elseif (-not $projectRecord -and -not $Record) {
+            $projectIdentity = Get-CodexProjectIdentity -Path $path
+            if ([string]::IsNullOrWhiteSpace($projectKey)) {
+                $projectKey = $projectIdentity.ProjectKey
+            }
+            if ([string]::IsNullOrWhiteSpace($projectName)) {
+                $projectName = $projectIdentity.Name
+            }
         }
     }
 
@@ -2057,10 +2369,21 @@ function New-PSUnpluggedManagedThread {
         [string]$Prompt,
         [string]$Name,
         [string[]]$Tags,
+        [switch]$CreateCwd,
+        [switch]$PromptInBackground,
+        [string]$ReadyFilePath,
         [switch]$PassThruSession
     )
 
-    $resolvedPath = Resolve-CodexProjectLocation -Path $Cwd
+    if ($CreateCwd -and -not [string]::IsNullOrWhiteSpace($Cwd)) {
+        $resolvedPath = Resolve-CodexProjectLocation -Path $Cwd -AllowMissing
+        if (-not (Test-Path -LiteralPath $resolvedPath)) {
+            $null = New-Item -ItemType Directory -Path $resolvedPath -Force
+        }
+    }
+    else {
+        $resolvedPath = Resolve-CodexProjectLocation -Path $Cwd
+    }
     $createdSession = $false
     if (-not $Session) {
         $Session = Start-CodexSession
@@ -2075,6 +2398,7 @@ function New-PSUnpluggedManagedThread {
     $thread = $null
     $initialTurn = $null
     $threadView = $null
+    $workerProcess = $null
 
     try {
         $params = @{
@@ -2107,16 +2431,25 @@ function New-PSUnpluggedManagedThread {
         }
         Export-PSUnpluggedCatalog -Catalog $catalog
 
-        if ($Prompt) {
-            $initialTurn = Invoke-CodexTurn -Session $Session -ThreadId $threadId -Text $Prompt
+        if (-not [string]::IsNullOrWhiteSpace($ReadyFilePath)) {
+            Write-PSUnpluggedTaskReadyFile -Path $ReadyFilePath -ThreadId $threadId -ProjectPath $projectRecord.Path
+        }
 
-            $catalog = Import-PSUnpluggedCatalog
-            $null = Set-CodexCatalogThreadRecord -Catalog $catalog -Properties @{
-                ThreadId       = $threadId
-                LastOpenedAt   = Get-PSUnpluggedUtcNowString
-                LastActivityAt = Get-PSUnpluggedUtcNowString
+        if ($Prompt) {
+            if ($PromptInBackground) {
+                $workerProcess = Start-PSUnpluggedTaskWorkerProcess -ThreadId $threadId -Prompt $Prompt -ProjectPath $projectRecord.Path
             }
-            Export-PSUnpluggedCatalog -Catalog $catalog
+            else {
+                $initialTurn = Invoke-CodexTurn -Session $Session -ThreadId $threadId -Text $Prompt
+
+                $catalog = Import-PSUnpluggedCatalog
+                $null = Set-CodexCatalogThreadRecord -Catalog $catalog -Properties @{
+                    ThreadId       = $threadId
+                    LastOpenedAt   = Get-PSUnpluggedUtcNowString
+                    LastActivityAt = Get-PSUnpluggedUtcNowString
+                }
+                Export-PSUnpluggedCatalog -Catalog $catalog
+            }
         }
 
         $catalog = Import-PSUnpluggedCatalog
@@ -2124,6 +2457,10 @@ function New-PSUnpluggedManagedThread {
         Update-CodexSessionIndex -Thread $threadView
         if ($initialTurn) {
             $threadView | Add-Member -NotePropertyName InitialTurn -NotePropertyValue $initialTurn -Force
+        }
+        if ($workerProcess) {
+            $threadView | Add-Member -NotePropertyName WorkerProcessId -NotePropertyValue $workerProcess.Id -Force
+            $threadView | Add-Member -NotePropertyName WorkerProcessName -NotePropertyValue $workerProcess.ProcessName -Force
         }
         if ($PassThruSession) {
             $threadView | Add-Member -NotePropertyName Session -NotePropertyValue $Session -Force
@@ -2430,6 +2767,8 @@ function Get-CodexTranscript {
         [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
         [switch]$IncludeArchived,
         [switch]$LocalOnly,
+        [switch]$IncludeTelemetry,
+        [ValidateSet('reasoning', 'tools', 'commands', 'all')][string[]]$TelemetryType,
         [int]$Limit = 25,
         [PSCustomObject]$Session,
         [Parameter(DontShow = $true)][string]$SpinnerStatus = 'Loading Codex transcript...'
@@ -2467,7 +2806,11 @@ function Get-CodexTranscript {
 
     end {
         $threadLookup = [ordered]@{}
-        $getThreadRecordCommand = Get-Command Get-CodexThreadRecord -CommandType Function -ErrorAction SilentlyContinue
+        $getThreadRecordCommand = Get-Command -Name Get-CodexThreadRecord -CommandType Function -ErrorAction Ignore
+        $effectiveTelemetryType = @($TelemetryType)
+        if ($IncludeTelemetry -and $effectiveTelemetryType.Count -eq 0) {
+            $effectiveTelemetryType = @('reasoning', 'tools', 'commands')
+        }
 
         foreach ($threadId in @($threadIds | Select-Object -Unique)) {
             $threadLookup[$threadId] = [PSCustomObject]@{
@@ -2550,7 +2893,7 @@ function Get-CodexTranscript {
                     $threadRecord = $null
 
                     if (-not [string]::IsNullOrWhiteSpace($sessionPath) -and (Test-Path -LiteralPath $sessionPath)) {
-                        $transcriptItems = @(ConvertTo-CodexTranscriptItemsFromSessionFile -Path $sessionPath -ThreadId $threadId -ThreadName $threadName -Project $projectName)
+                        $transcriptItems = @(ConvertTo-CodexTranscriptItemsFromSessionFile -Path $sessionPath -ThreadId $threadId -ThreadName $threadName -Project $projectName -TelemetryType $effectiveTelemetryType)
                     }
 
                     if ($transcriptItems.Count -eq 0 -and -not $LocalOnly -and $getThreadRecordCommand) {
@@ -2581,6 +2924,10 @@ function Get-CodexTranscript {
 
                     if ($transcriptItems.Count -eq 0 -and $threadRecord -and $threadRecord.thread) {
                         $transcriptItems = @(ConvertTo-CodexTranscriptItemsFromThreadRecord -Thread $threadRecord.thread -ThreadName $threadName -Project $projectName)
+                    }
+
+                    if ($readError -and $transcriptItems.Count -eq 0 -and (Test-CodexEmptyRolloutError -ErrorRecord $readError)) {
+                        $readError = $null
                     }
 
                     if ($readError -and $transcriptItems.Count -eq 0) {
@@ -3441,8 +3788,1090 @@ function Enter-CodexThread {
     }
 }
 
+function ConvertTo-CodexTaskOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline = $true)]
+        [AllowNull()]$InputObject
+    )
+
+    process {
+        if ($null -eq $InputObject) {
+            return
+        }
+
+        $taskId = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('TaskId', 'ThreadId', 'threadId'))
+        if ([string]::IsNullOrWhiteSpace($taskId)) {
+            return $InputObject
+        }
+
+        $null = $InputObject | Add-Member -NotePropertyName TaskId -NotePropertyValue $taskId -Force
+        if (-not ($InputObject.PSObject.TypeNames -contains 'PSUnplugged.CodexTask')) {
+            $InputObject.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTask')
+        }
+
+        return $InputObject
+    }
+}
+
+function ConvertTo-CodexTaskReceiveOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline = $true)]
+        $InputObject
+    )
+
+    process {
+        if ($null -eq $InputObject) {
+            return
+        }
+
+        $taskId = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('TaskId', 'ThreadId', 'threadId'))
+        if ([string]::IsNullOrWhiteSpace($taskId)) {
+            return
+        }
+
+        $output = [PSCustomObject]@{
+            Id        = Get-CodexCompactId -Id $taskId
+            TaskId    = $taskId
+            ThreadId  = $taskId
+            Name      = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('ThreadName', 'threadName', 'Name', 'name'))
+            Project   = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Project', 'project'))
+            Role      = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Role', 'role'))
+            Phase     = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Phase', 'phase'))
+            When      = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('When', 'when'))
+            Timestamp = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Timestamp', 'timestamp'))
+            Text      = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Text', 'text'))
+            RawItem   = $InputObject
+        }
+
+        $output.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTaskReceive')
+        return $output
+    }
+}
+
+function Resolve-CodexTaskIdentifier {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [string]) {
+        return [string]$InputObject
+    }
+
+    $explicitTaskId = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('TaskId', 'ThreadId', 'threadId'))
+    if (-not [string]::IsNullOrWhiteSpace($explicitTaskId)) {
+        return $explicitTaskId
+    }
+
+    $fallbackId = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Id', 'id'))
+    if ($fallbackId -match '^(urn:uuid:)?[0-9a-fA-F-]{32,36}$') {
+        return $fallbackId
+    }
+
+    return $null
+}
+
+function Get-CodexTaskReadyFilePath {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    return [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('ReadyFilePath', 'readyFilePath'))
+}
+
+function Test-CodexEmptyRolloutError {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$ErrorRecord
+    )
+
+    if ($null -eq $ErrorRecord) {
+        return $false
+    }
+
+    $message = [string]$ErrorRecord
+    if ([string]::IsNullOrWhiteSpace($message) -and $ErrorRecord.Exception) {
+        $message = [string]$ErrorRecord.Exception.Message
+    }
+
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        return $false
+    }
+
+    return (
+        $message -like '*failed to load rollout*' -and
+        $message -like '*rollout*is empty*'
+    )
+}
+
+function Test-CodexTranscriptHasAssistantOutput {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object[]]$Transcript
+    )
+
+    foreach ($item in @($Transcript)) {
+        $role = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Role', 'role'))
+        $text = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Text', 'text'))
+        if ($role -eq 'assistant' -and -not [string]::IsNullOrWhiteSpace($text)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-CodexTaskWorkerCompleted {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        return $false
+    }
+
+    $stdoutPath = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('WorkerStdOutPath', 'workerStdOutPath'))
+    if (-not [string]::IsNullOrWhiteSpace($stdoutPath) -and (Test-Path -LiteralPath $stdoutPath)) {
+        try {
+            if (Select-String -Path $stdoutPath -Pattern 'WORKER_END' -Quiet -ErrorAction Stop) {
+                return $true
+            }
+        }
+        catch {
+        }
+    }
+
+    $processId = Get-CodexFirstValue -InputObject $InputObject -PropertyName @('WorkerProcessId', 'workerProcessId')
+    if ($null -eq $processId) {
+        return $false
+    }
+
+    $processIdText = [string]$processId
+    if ([string]::IsNullOrWhiteSpace($processIdText)) {
+        return $false
+    }
+
+    $processIdValue = 0
+    if (-not [int]::TryParse($processIdText, [ref]$processIdValue)) {
+        return $false
+    }
+
+    return ($null -eq (Get-Process -Id $processIdValue -ErrorAction Ignore))
+}
+
+function Test-CodexTaskCompletion {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Task,
+        [AllowNull()][object[]]$Transcript
+    )
+
+    if ($null -eq $Task) {
+        return $false
+    }
+
+    $status = [string](Get-CodexFirstValue -InputObject $Task -PropertyName @('Status', 'status'))
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        $normalizedStatus = $status.Trim().ToLowerInvariant()
+        if ($normalizedStatus -in @('completed', 'complete', 'failed', 'error', 'cancelled', 'canceled', 'archived')) {
+            return $true
+        }
+    }
+
+    $terminalTranscriptItem = @(
+        @($Transcript) |
+            Where-Object {
+                $phase = [string](Get-CodexFirstValue -InputObject $_ -PropertyName @('Phase', 'phase'))
+                if ([string]::IsNullOrWhiteSpace($phase)) {
+                    return $false
+                }
+
+                $phase.Trim().ToLowerInvariant() -in @('final_answer', 'failed', 'error', 'cancelled', 'canceled')
+            } |
+            Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } }
+    ) | Select-Object -Last 1
+
+    return ($null -ne $terminalTranscriptItem)
+}
+
+function Get-CodexTaskTranscriptItemKey {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Item
+    )
+
+    if ($null -eq $Item) {
+        return $null
+    }
+
+    $threadId = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('ThreadId', 'threadId'))
+    $turnId = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('TurnId', 'turnId'))
+    $index = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('Index', 'index'))
+    $role = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('Role', 'role'))
+    $phase = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('Phase', 'phase'))
+    $timestamp = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('Timestamp', 'timestamp'))
+    $text = [string](Get-CodexFirstValue -InputObject $Item -PropertyName @('Text', 'text'))
+
+    return '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $threadId, $turnId, $index, $role, $phase, $timestamp, $text
+}
+
+function Write-CodexTaskTailItems {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object[]]$TranscriptItem
+    )
+
+    $lastRenderedByThread = @{}
+
+    foreach ($item in @($TranscriptItem)) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $threadId = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('ThreadId', 'threadId'))
+        $text = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Text', 'text'))
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+
+        $role = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Role', 'role'))
+        $phase = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Phase', 'phase'))
+
+        if (-not [string]::IsNullOrWhiteSpace($threadId) -and $lastRenderedByThread.ContainsKey($threadId)) {
+            $previous = $lastRenderedByThread[$threadId]
+            if (
+                $role -eq 'assistant' -and
+                $previous.Role -eq 'assistant' -and
+                $previous.Text -eq $text
+            ) {
+                continue
+            }
+        }
+
+        $when = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('When', 'when'))
+        $labelParts = [System.Collections.Generic.List[string]]::new()
+        if (-not [string]::IsNullOrWhiteSpace($when)) {
+            $labelParts.Add($when)
+        }
+
+        switch ($phase) {
+            'reasoning' {
+                $labelParts.Add('thinking')
+                break
+            }
+            'tool' {
+                $labelParts.Add('tool')
+                break
+            }
+            'command' {
+                $labelParts.Add('command')
+                break
+            }
+            default {
+                foreach ($part in @($role, $phase)) {
+                    if (-not [string]::IsNullOrWhiteSpace($part)) {
+                        $labelParts.Add($part)
+                    }
+                }
+                break
+            }
+        }
+
+        $label = if ($labelParts.Count -gt 0) { '[' + ($labelParts -join ' | ') + ']' } else { '[task]' }
+
+        Write-Host "$label $text" -ForegroundColor DarkGray
+        if (-not [string]::IsNullOrWhiteSpace($threadId)) {
+            $lastRenderedByThread[$threadId] = @{
+                Role = $role
+                Text = $text
+            }
+        }
+    }
+}
+
+function Write-PSUnpluggedTaskReadyFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ThreadId,
+        [string]$ProjectPath
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
+        $null = New-Item -ItemType Directory -Path $directory -Force
+    }
+
+    $payload = [ordered]@{
+        ThreadId    = $ThreadId
+        ProjectPath = $ProjectPath
+        ReadyAt     = (Get-Date).ToString('o')
+    }
+
+    Set-Content -LiteralPath $Path -Value ($payload | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8
+}
+
+function Start-PSUnpluggedTaskWorkerProcess {
+    [CmdletBinding()]
+    param(
+        [string]$Model = 'gpt-5.1-codex',
+        [string]$Cwd,
+        [string]$ApprovalPolicy = 'never',
+        [string]$SandboxType = 'workspace-write',
+        [Parameter(Mandatory)][string]$Prompt,
+        [string]$Name,
+        [string[]]$Tags,
+        [switch]$CreateCwd
+    )
+
+    $modulePath = Join-Path (Get-PSUnpluggedModuleRoot) 'PSUnplugged.psd1'
+    $workerRoot = Join-Path (Get-PSUnpluggedDataRoot) 'task-workers'
+    if (-not (Test-Path -LiteralPath $workerRoot)) {
+        $null = New-Item -ItemType Directory -Path $workerRoot -Force
+    }
+
+    $workerId = [guid]::NewGuid().ToString('N')
+    $paramsPath = Join-Path $workerRoot "$workerId.params.json"
+    $readyPath = Join-Path $workerRoot "$workerId.ready.json"
+    $scriptPath = Join-Path $workerRoot "$workerId.worker.ps1"
+    $stdoutPath = Join-Path $workerRoot "$workerId.stdout.log"
+    $stderrPath = Join-Path $workerRoot "$workerId.stderr.log"
+
+    $payload = [ordered]@{
+        Model         = $Model
+        Cwd           = $Cwd
+        ApprovalPolicy = $ApprovalPolicy
+        SandboxType   = $SandboxType
+        Prompt        = $Prompt
+        Name          = $Name
+        Tags          = @($Tags)
+        CreateCwd     = [bool]$CreateCwd
+        ReadyFilePath = $readyPath
+    }
+    Set-Content -LiteralPath $paramsPath -Value ($payload | ConvertTo-Json -Depth 6 -Compress) -Encoding utf8
+
+    $runner = if (Get-Command pwsh -ErrorAction SilentlyContinue) {
+        (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    }
+    elseif (Get-Command powershell -ErrorAction SilentlyContinue) {
+        (Get-Command powershell -ErrorAction SilentlyContinue).Source
+    }
+    else {
+        throw 'Unable to find pwsh or powershell to launch the Codex task worker process.'
+    }
+
+    $escapedModulePath = $modulePath.Replace("'", "''")
+    $escapedParamsPath = $paramsPath.Replace("'", "''")
+    $workerScript = @"
+Import-Module -Name '$escapedModulePath' -Force
+`$payload = Get-Content -LiteralPath '$escapedParamsPath' -Raw | ConvertFrom-Json
+Write-Output 'WORKER_START'
+`$detachedParams = @{
+    Model          = [string]`$payload.Model
+    Cwd            = [string]`$payload.Cwd
+    ApprovalPolicy = [string]`$payload.ApprovalPolicy
+    SandboxType    = [string]`$payload.SandboxType
+    Prompt         = [string]`$payload.Prompt
+    Name           = [string]`$payload.Name
+    ReadyFilePath  = [string]`$payload.ReadyFilePath
+}
+if (`$payload.Tags) { `$detachedParams.Tags = @(`$payload.Tags | Where-Object { `$null -ne `$_ }) }
+if ([bool]`$payload.CreateCwd) { `$detachedParams.CreateCwd = `$true }
+`$module = Get-Module PSUnplugged
+if (`$null -eq `$module) { throw 'PSUnplugged module is not loaded in worker process.' }
+& `$module { param(`$p) New-PSUnpluggedManagedThread @p | Out-Null } `$detachedParams
+Write-Output 'WORKER_END'
+"@
+    Set-Content -LiteralPath $scriptPath -Value $workerScript -Encoding utf8
+
+    $startParams = @{
+        FilePath               = $runner
+        ArgumentList           = @('-NoProfile', '-File', $scriptPath)
+        PassThru               = $true
+        RedirectStandardOutput = $stdoutPath
+        RedirectStandardError  = $stderrPath
+    }
+
+    if ($IsWindows) {
+        $startParams.WindowStyle = 'Hidden'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ProjectPath) -and (Test-Path -LiteralPath $ProjectPath)) {
+        $startParams.WorkingDirectory = $ProjectPath
+    }
+
+    $process = Start-Process @startParams
+    return [PSCustomObject]@{
+        Process    = $process
+        ParamsPath = $paramsPath
+        ReadyPath  = $readyPath
+        ScriptPath = $scriptPath
+        StdOutPath = $stdoutPath
+        StdErrPath = $stderrPath
+    }
+}
+
+function Start-CodexTask {
+    <#
+    .SYNOPSIS
+        Starts a managed Codex task using the thread runtime under the covers.
+    .DESCRIPTION
+        This is the task-oriented wrapper for New-CodexThread. It always uses the
+        managed thread flow so the resulting task is cataloged and can be inspected
+        later with Get-CodexTask and Receive-CodexTask.
+    #>
+    [CmdletBinding()]
+    param(
+        [PSCustomObject]$Session,
+        [string]$Model = 'gpt-5.1-codex',
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]
+        $InputObject,
+        [Alias('Path')]
+        [string]$Cwd,
+        [string]$ApprovalPolicy = 'never',
+        [ValidateSet('read-only', 'workspace-write', 'danger-full-access')]
+        [string]$SandboxType = 'workspace-write',
+        [Parameter(Position = 0)]
+        [Alias('Task', 'Instruction', 'Text')]
+        [string]$Prompt,
+        [string]$Name,
+        [string[]]$Tags,
+        [switch]$CreateCwd,
+        [switch]$PassThruSession
+    )
+
+    process {
+        $effectiveCwd = $Cwd
+        if ([string]::IsNullOrWhiteSpace($effectiveCwd) -and $null -ne $InputObject) {
+            if ($InputObject -is [string]) {
+                $effectiveCwd = [string]$InputObject
+            }
+            elseif ($InputObject.PSObject) {
+                foreach ($propertyName in 'Path', 'path', 'ProjectPath', 'projectPath', 'Cwd', 'cwd') {
+                    $property = $InputObject.PSObject.Properties[$propertyName]
+                    if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                        $effectiveCwd = [string]$property.Value
+                        break
+                    }
+                }
+            }
+        }
+
+        $taskParams = @{}
+        foreach ($entry in $PSBoundParameters.GetEnumerator()) {
+            if ($entry.Key -eq 'InputObject') {
+                continue
+            }
+
+            $taskParams[$entry.Key] = $entry.Value
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($effectiveCwd)) {
+            $taskParams.Cwd = $effectiveCwd
+        }
+        elseif ($taskParams.ContainsKey('Cwd')) {
+            $taskParams.Remove('Cwd')
+        }
+
+        $task = $null
+        if ($taskParams.ContainsKey('Prompt')) {
+            $workerParams = @{}
+            foreach ($workerKey in 'Model', 'Cwd', 'ApprovalPolicy', 'SandboxType', 'Prompt', 'Name', 'Tags', 'CreateCwd') {
+                if ($taskParams.ContainsKey($workerKey)) {
+                    $workerParams[$workerKey] = $taskParams[$workerKey]
+                }
+            }
+
+            $worker = Start-PSUnpluggedTaskWorkerProcess @workerParams
+            $projectName = if (-not [string]::IsNullOrWhiteSpace($Name)) {
+                $Name
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($effectiveCwd)) {
+                Split-Path -Leaf $effectiveCwd
+            }
+            else {
+                'Pending Codex task'
+            }
+
+            $task = [PSCustomObject]@{
+                Id              = if ($worker.Process) { 'pending-' + [string]$worker.Process.Id } else { 'pending' }
+                TaskId          = $null
+                ThreadId        = $null
+                Name            = if (-not [string]::IsNullOrWhiteSpace($prompt)) { $prompt } else { $projectName }
+                Project         = $projectName
+                Path            = $effectiveCwd
+                Status          = 'starting'
+                ReadyFilePath   = [string]$worker.ReadyPath
+                WorkerProcessId = if ($worker.Process) { $worker.Process.Id } else { $null }
+                WorkerProcessName = if ($worker.Process) { $worker.Process.ProcessName } else { $null }
+                WorkerStdOutPath = [string]$worker.StdOutPath
+                WorkerStdErrPath = [string]$worker.StdErrPath
+            }
+            $task.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTask')
+        }
+        else {
+            $task = New-PSUnpluggedManagedThread @taskParams
+        }
+
+        if ($task) {
+            return ($task | ConvertTo-CodexTaskOutput)
+        }
+    }
+}
+
+function Get-CodexTask {
+    <#
+    .SYNOPSIS
+        Returns managed Codex tasks using task-first terminology.
+    #>
+    [CmdletBinding()]
+    param(
+        [Alias('TaskId', 'ThreadId')][string]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [Parameter(ValueFromPipelineByPropertyName = $true, DontShow = $true)][string]$ProjectKey,
+        [Parameter(ValueFromPipelineByPropertyName = $true, DontShow = $true)][Alias('Name')][string]$ProjectName,
+        [Parameter(ValueFromPipelineByPropertyName = $true, DontShow = $true)][Alias('Path')][string]$ProjectPathInput,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 25,
+        [PSCustomObject]$Session,
+        [Parameter(DontShow = $true)][string]$SpinnerStatus = 'Loading Codex tasks...'
+    )
+
+    process {
+        Get-CodexThread @PSBoundParameters | ConvertTo-CodexTaskOutput
+    }
+}
+
+function Receive-CodexTask {
+    <#
+    .SYNOPSIS
+        Receives the latest useful output for one or more Codex tasks.
+    .DESCRIPTION
+        By default, returns the latest assistant message with text for each task.
+        Use -Transcript to return the full transcript stream, or -Text for plain text.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [switch]$Transcript,
+        [switch]$ShowTelemetry,
+        [switch]$ShowReasoning,
+        [switch]$ShowTools,
+        [switch]$ShowCommands,
+        [switch]$Text,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 25,
+        [PSCustomObject]$Session
+    )
+
+    begin {
+        $items = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            $items.Add($InputObject)
+        }
+    }
+
+    end {
+        $telemetryTypes = [System.Collections.Generic.List[string]]::new()
+        if ($ShowTelemetry -or $ShowReasoning) { $telemetryTypes.Add('reasoning') }
+        if ($ShowTelemetry -or $ShowTools) { $telemetryTypes.Add('tools') }
+        if ($ShowTelemetry -or $ShowCommands) { $telemetryTypes.Add('commands') }
+        $telemetryTypes = [System.Collections.Generic.List[string]]@(@($telemetryTypes | Select-Object -Unique))
+
+        $transcriptParams = @{
+            Limit         = $Limit
+            SpinnerStatus = 'Receiving Codex task output...'
+        }
+        if ($Id) { $transcriptParams.Id = $Id }
+        if ($Project) { $transcriptParams.Project = $Project }
+        if ($IncludeArchived) { $transcriptParams.IncludeArchived = $true }
+        if ($LocalOnly) { $transcriptParams.LocalOnly = $true }
+        if ($Session) { $transcriptParams.Session = $Session }
+        if ($telemetryTypes.Count -gt 0) {
+            $transcriptParams.IncludeTelemetry = $true
+            $transcriptParams.TelemetryType = @($telemetryTypes)
+        }
+
+        $transcriptItems = if ($items.Count -gt 0) {
+            $pipelineTranscriptParams = @{
+                Limit         = $Limit
+                SpinnerStatus = 'Receiving Codex task output...'
+            }
+            if ($IncludeArchived) { $pipelineTranscriptParams.IncludeArchived = $true }
+            if ($LocalOnly) { $pipelineTranscriptParams.LocalOnly = $true }
+            if ($Session) { $pipelineTranscriptParams.Session = $Session }
+            if ($telemetryTypes.Count -gt 0) {
+                $pipelineTranscriptParams.IncludeTelemetry = $true
+                $pipelineTranscriptParams.TelemetryType = @($telemetryTypes)
+            }
+
+            @($items | Get-CodexTranscript @pipelineTranscriptParams)
+        }
+        else {
+            @(
+                Get-CodexTranscript @transcriptParams
+            )
+        }
+
+        if ($Transcript) {
+            if ($Text) {
+                return @($transcriptItems | ForEach-Object { [string]$_.Text })
+            }
+
+            return @($transcriptItems)
+        }
+
+        $latestItems = foreach ($group in @($transcriptItems | Group-Object ThreadId)) {
+            $ordered = @(
+                $group.Group |
+                    Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } }
+            )
+
+            $latestAssistant = @(
+                $ordered |
+                    Where-Object {
+                        $_.Role -eq 'assistant' -and
+                        -not [string]::IsNullOrWhiteSpace([string]$_.Text)
+                    }
+            ) | Select-Object -Last 1
+
+            if ($latestAssistant) {
+                $latestAssistant
+                continue
+            }
+
+            $latestTextItem = @(
+                $ordered |
+                    Where-Object {
+                        $_.Role -ne 'user' -and
+                        -not [string]::IsNullOrWhiteSpace([string]$_.Text)
+                    }
+            ) | Select-Object -Last 1
+
+            if ($latestTextItem) {
+                $latestTextItem
+                continue
+            }
+        }
+
+        if ($Text) {
+            return @($latestItems | ForEach-Object { [string]$_.Text })
+        }
+
+        return @($latestItems | ConvertTo-CodexTaskReceiveOutput)
+    }
+}
+
+function Resume-CodexTask {
+    <#
+    .SYNOPSIS
+        Resumes a managed Codex task by task ID.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string]$Id,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [Alias('Path', 'Project')][string]$ProjectPath,
+        [string]$Prompt,
+        [string]$Model = 'gpt-5.1-codex',
+        [PSCustomObject]$Session
+    )
+
+    process {
+        $resolvedId = if ($null -ne $InputObject) {
+            Resolve-CodexTaskIdentifier -InputObject $InputObject
+        }
+        else {
+            $Id
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedId)) {
+            $resolvedId = $Id
+        }
+
+        $resumeParams = @{
+            Id      = $resolvedId
+            Prompt  = $Prompt
+            Model   = $Model
+        }
+        if ($ProjectPath) { $resumeParams.ProjectPath = $ProjectPath }
+        if ($Session) { $resumeParams.Session = $Session }
+
+        $result = Enter-CodexThread @resumeParams
+        if ($result -and $result.PSObject.Properties['ThreadId']) {
+            $null = $result | Add-Member -NotePropertyName TaskId -NotePropertyValue ([string]$result.ThreadId) -Force
+            if (-not ($result.PSObject.TypeNames -contains 'PSUnplugged.CodexTaskTurn')) {
+                $result.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTaskTurn')
+            }
+        }
+
+        return $result
+    }
+}
+
+function Wait-CodexTask {
+    <#
+    .SYNOPSIS
+        Waits for one or more Codex tasks to reach a terminal state.
+    .DESCRIPTION
+        A task is treated as complete when its status is terminal or when its
+        transcript contains a terminal assistant phase such as final_answer.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [switch]$Any,
+        [switch]$Tail,
+        [switch]$ShowTelemetry,
+        [switch]$ShowReasoning,
+        [switch]$ShowTools,
+        [switch]$ShowCommands,
+        [switch]$Receive,
+        [switch]$Text,
+        [switch]$Transcript,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 25,
+        [int]$TimeoutSec = 0,
+        [int]$PollIntervalMs = 1000,
+        [int]$HeartbeatSec = 15,
+        [PSCustomObject]$Session
+    )
+
+    begin {
+        $inputs = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            $inputs.Add($InputObject)
+        }
+    }
+
+    end {
+        $taskLookup = [ordered]@{}
+        $seenTranscriptKeysByTask = @{}
+        $lastHeartbeatAt = Get-Date
+        $tailTelemetryTypes = [System.Collections.Generic.List[string]]::new()
+        if ($ShowTelemetry -or $ShowReasoning) { $tailTelemetryTypes.Add('reasoning') }
+        if ($ShowTelemetry -or $ShowTools) { $tailTelemetryTypes.Add('tools') }
+        if ($ShowTelemetry -or $ShowCommands) { $tailTelemetryTypes.Add('commands') }
+        $tailTelemetryTypes = [System.Collections.Generic.List[string]]@(@($tailTelemetryTypes | Select-Object -Unique))
+
+        if ($inputs.Count -eq 0) {
+            foreach ($taskId in @($Id)) {
+                if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                    $taskLookup[[string]$taskId] = [PSCustomObject]@{ TaskId = [string]$taskId }
+                }
+            }
+        }
+
+        foreach ($item in @($inputs)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $item
+            if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                if ($item -is [string]) {
+                    $taskLookup[[string]$taskId] = [PSCustomObject]@{ TaskId = [string]$taskId }
+                }
+                else {
+                    $taskLookup[$taskId] = $item
+                }
+                continue
+            }
+
+            $readyFilePath = Get-CodexTaskReadyFilePath -InputObject $item
+            if (-not [string]::IsNullOrWhiteSpace($readyFilePath)) {
+                $taskLookup["pending::$readyFilePath"] = $item
+            }
+        }
+
+        if (($taskLookup.Count -eq 0) -and -not [string]::IsNullOrWhiteSpace($Project)) {
+            foreach ($task in @(Get-CodexTask -Project $Project -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit $Limit -Session $Session)) {
+                if ($task -and -not [string]::IsNullOrWhiteSpace([string]$task.TaskId)) {
+                    $taskLookup[[string]$task.TaskId] = $task
+                }
+            }
+        }
+
+        if ($taskLookup.Count -eq 0) {
+            return
+        }
+
+        $deadline = if ($TimeoutSec -gt 0) { (Get-Date).AddSeconds($TimeoutSec) } else { $null }
+
+        if ($Tail) {
+            foreach ($taskId in @($taskLookup.Keys)) {
+                $taskHandle = $taskLookup[$taskId]
+                $resolvedTaskId = Resolve-CodexTaskIdentifier -InputObject $taskHandle
+                if ([string]::IsNullOrWhiteSpace($resolvedTaskId)) {
+                    continue
+                }
+
+                $seenTranscriptKeysByTask[$resolvedTaskId] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+                $baselineTranscriptParams = @{
+                    Id            = $resolvedTaskId
+                    Limit         = $Limit
+                    SpinnerStatus = $null
+                }
+                if ($IncludeArchived) { $baselineTranscriptParams.IncludeArchived = $true }
+                if ($LocalOnly) { $baselineTranscriptParams.LocalOnly = $true }
+                if ($Session) { $baselineTranscriptParams.Session = $Session }
+                if ($tailTelemetryTypes.Count -gt 0) {
+                    $baselineTranscriptParams.IncludeTelemetry = $true
+                    $baselineTranscriptParams.TelemetryType = @($tailTelemetryTypes)
+                }
+
+                foreach ($item in @(Get-CodexTranscript @baselineTranscriptParams)) {
+                    $key = Get-CodexTaskTranscriptItemKey -Item $item
+                    if (-not [string]::IsNullOrWhiteSpace($key)) {
+                        $null = $seenTranscriptKeysByTask[$resolvedTaskId].Add($key)
+                    }
+                }
+            }
+        }
+
+        while ($true) {
+            $completed = [System.Collections.Generic.List[object]]::new()
+            $sawNewTailOutput = $false
+            $latestTaskSnapshot = [System.Collections.Generic.List[object]]::new()
+
+            foreach ($taskId in @($taskLookup.Keys)) {
+                $taskHandle = $taskLookup[$taskId]
+                $resolvedTaskId = Resolve-CodexTaskIdentifier -InputObject $taskHandle
+                if ([string]::IsNullOrWhiteSpace($resolvedTaskId)) {
+                    $readyFilePath = Get-CodexTaskReadyFilePath -InputObject $taskHandle
+                    if (-not [string]::IsNullOrWhiteSpace($readyFilePath) -and (Test-Path -LiteralPath $readyFilePath)) {
+                        try {
+                            $readyPayload = Get-Content -LiteralPath $readyFilePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                        }
+                        catch {
+                            $readyPayload = $null
+                        }
+
+                        if ($readyPayload -and -not [string]::IsNullOrWhiteSpace([string]$readyPayload.ThreadId)) {
+                            $resolvedTaskId = [string]$readyPayload.ThreadId
+                            $taskLookup.Remove($taskId)
+                            $taskLookup[$resolvedTaskId] = $taskHandle
+                        }
+                    }
+                }
+
+                if ([string]::IsNullOrWhiteSpace($resolvedTaskId)) {
+                    $latestTaskSnapshot.Add($taskHandle)
+                    continue
+                }
+
+                $getLocalTaskParams = @{
+                    Id            = $resolvedTaskId
+                    Limit         = 1
+                    SpinnerStatus = $null
+                    LocalOnly     = $true
+                }
+                if ($IncludeArchived) { $getLocalTaskParams.IncludeArchived = $true }
+
+                $task = Get-CodexTask @getLocalTaskParams |
+                    Select-Object -First 1
+                if ((-not $task) -and -not $LocalOnly) {
+                    $getTaskParams = @{
+                        Id            = $resolvedTaskId
+                        Limit         = 1
+                        SpinnerStatus = $null
+                    }
+                    if ($IncludeArchived) { $getTaskParams.IncludeArchived = $true }
+                    if ($Session) { $getTaskParams.Session = $Session }
+
+                    $task = Get-CodexTask @getTaskParams |
+                        Select-Object -First 1
+                }
+
+                if (-not $task) {
+                    $task = [PSCustomObject]@{
+                        TaskId = $resolvedTaskId
+                        Id     = Get-CodexCompactId -Id $resolvedTaskId
+                        Status = 'missing'
+                    }
+                    $task.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTask')
+                }
+                $latestTaskSnapshot.Add($task)
+
+                $localTranscriptParams = @{
+                    Id            = $resolvedTaskId
+                    Limit         = $Limit
+                    SpinnerStatus = $null
+                    LocalOnly     = $true
+                }
+                if ($IncludeArchived) { $localTranscriptParams.IncludeArchived = $true }
+                if ($tailTelemetryTypes.Count -gt 0) {
+                    $localTranscriptParams.IncludeTelemetry = $true
+                    $localTranscriptParams.TelemetryType = @($tailTelemetryTypes)
+                }
+
+                $transcriptItems = @(Get-CodexTranscript @localTranscriptParams)
+                if (($transcriptItems.Count -eq 0) -and -not $LocalOnly) {
+                    $transcriptParams = @{
+                        Id            = $resolvedTaskId
+                        Limit         = $Limit
+                        SpinnerStatus = $null
+                    }
+                    if ($IncludeArchived) { $transcriptParams.IncludeArchived = $true }
+                    if ($Session) { $transcriptParams.Session = $Session }
+                    if ($tailTelemetryTypes.Count -gt 0) {
+                        $transcriptParams.IncludeTelemetry = $true
+                        $transcriptParams.TelemetryType = @($tailTelemetryTypes)
+                    }
+
+                    $transcriptItems = @(Get-CodexTranscript @transcriptParams)
+                }
+
+                if ($Tail) {
+                    if (-not $seenTranscriptKeysByTask.ContainsKey($resolvedTaskId)) {
+                        $seenTranscriptKeysByTask[$resolvedTaskId] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                    }
+
+                    $newItems = [System.Collections.Generic.List[object]]::new()
+                    foreach ($item in @($transcriptItems | Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } })) {
+                        $key = Get-CodexTaskTranscriptItemKey -Item $item
+                        if ([string]::IsNullOrWhiteSpace($key)) {
+                            continue
+                        }
+
+                        if ($seenTranscriptKeysByTask[$resolvedTaskId].Add($key)) {
+                            $newItems.Add($item)
+                        }
+                    }
+
+                    if ($newItems.Count -gt 0) {
+                        Write-CodexTaskTailItems -TranscriptItem @($newItems)
+                        $sawNewTailOutput = $true
+                    }
+                }
+
+                $hasAssistantOutput = Test-CodexTranscriptHasAssistantOutput -Transcript $transcriptItems
+                if (Test-CodexTaskCompletion -Task $task -Transcript $transcriptItems) {
+                    $task | Add-Member -NotePropertyName Status -NotePropertyValue 'completed' -Force
+                    $completed.Add($task)
+                }
+                elseif ((-not $hasAssistantOutput) -and (Test-CodexTaskWorkerCompleted -InputObject $taskHandle)) {
+                    $task | Add-Member -NotePropertyName Status -NotePropertyValue 'completed' -Force
+                    $completed.Add($task)
+                }
+            }
+
+            if ($completed.Count -gt 0) {
+                $tasksToReturn = if ($Any) { @($completed | Select-Object -First 1) } else { @($completed) }
+                if ($Receive) {
+                    $receiveParams = @{
+                        Limit = $Limit
+                    }
+                    if ($Transcript) { $receiveParams.Transcript = $true }
+                    if ($Text) { $receiveParams.Text = $true }
+                    if ($IncludeArchived) { $receiveParams.IncludeArchived = $true }
+                    if ($LocalOnly) { $receiveParams.LocalOnly = $true }
+                    if ($Session) { $receiveParams.Session = $Session }
+
+                    return @($tasksToReturn | Receive-CodexTask @receiveParams)
+                }
+
+                return @($tasksToReturn)
+            }
+
+            if ($deadline -and ((Get-Date) -ge $deadline)) {
+                Write-Warning "Timed out after $TimeoutSec second(s) while waiting for Codex task completion."
+                if ($Receive) {
+                    $receiveParams = @{
+                        Limit = $Limit
+                    }
+                    if ($Transcript) { $receiveParams.Transcript = $true }
+                    if ($Text) { $receiveParams.Text = $true }
+                    if ($IncludeArchived) { $receiveParams.IncludeArchived = $true }
+                    if ($LocalOnly) { $receiveParams.LocalOnly = $true }
+                    if ($Session) { $receiveParams.Session = $Session }
+
+                    return @($latestTaskSnapshot | Receive-CodexTask @receiveParams)
+                }
+
+                return @($latestTaskSnapshot)
+            }
+
+            if ($Tail -and (-not $sawNewTailOutput) -and ($HeartbeatSec -gt 0)) {
+                $now = Get-Date
+                if (($now - $lastHeartbeatAt).TotalSeconds -ge $HeartbeatSec) {
+                    if ($deadline) {
+                        $elapsedSeconds = [int]($TimeoutSec - ($deadline - $now).TotalSeconds)
+                        if ($elapsedSeconds -lt 0) { $elapsedSeconds = $TimeoutSec }
+                        Write-Host "[working | ${elapsedSeconds}s] No new task updates yet." -ForegroundColor DarkGray
+                    }
+                    else {
+                        Write-Host '[working] No new task updates yet.' -ForegroundColor DarkGray
+                    }
+
+                    $lastHeartbeatAt = $now
+                }
+            }
+
+            Start-Sleep -Milliseconds ([Math]::Max(100, $PollIntervalMs))
+        }
+    }
+}
+
+function Remove-CodexTask {
+    <#
+    .SYNOPSIS
+        Archives or purges local metadata for a managed Codex task.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('Id', 'ThreadId')][string]$TaskId,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [switch]$Purge
+    )
+
+    process {
+        $resolvedTaskId = if ($null -ne $InputObject) {
+            Resolve-CodexTaskIdentifier -InputObject $InputObject
+        }
+        else {
+            $TaskId
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedTaskId)) {
+            throw 'TaskId is required.'
+        }
+
+        Remove-CodexThread -ThreadId $resolvedTaskId -Purge:$Purge
+    }
+}
+
 Update-TypeData -TypeName 'PSUnplugged.CodexProject' -DefaultDisplayPropertySet Name, Kind, LastActive -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexProject.Details' -DefaultDisplayPropertySet Name, Kind, ThreadSummary, LastActive -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexThread' -DefaultDisplayPropertySet Id, Name, Project, Status, When -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexTask' -DefaultDisplayPropertySet Id, Name, Project, Status, When -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTranscriptItem' -DefaultDisplayPropertySet Role, Phase, When, Text -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexTaskReceive' -DefaultDisplayPropertySet Id, Name, Project, Role, When, Text -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexTaskTurn' -DefaultDisplayPropertySet TaskId, Prompt, Result -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTranscriptPage' -DefaultDisplayPropertySet Path, ThreadCount, ItemCount, Opened -Force
