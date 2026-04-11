@@ -2,13 +2,31 @@
 
 Project-aware thread management for PSUnplugged.
 
-This folder adds the higher-level PowerShell UX on top of the raw Codex JSON-RPC calls in the root module. The goal is simple: start work in one place, hop to another shell or machine, and still see which projects and threads are cooking.
+This folder adds the higher-level PowerShell UX on top of the raw Codex JSON-RPC calls in the root module. The goal is simple: start governed agent work in one place, hop to another shell or machine, and still see which projects and threads are cooking.
+
+## PowerShell Mental Model
+
+If `Start-Job`, `Get-Job`, and `Receive-Job` are already in your fingers, this layer should feel familiar.
+
+- `Start-CodexSession` is the connected runtime context.
+- `New-CodexThread` starts a unit of agent work.
+- `Get-CodexThread` is the main inspection surface.
+- `Get-CodexTranscript` is today's closest analogue to "receive the latest useful output."
+- `Enter-CodexThread` and `Resume-CodexThread` are how you pick work back up.
+
+The important difference is that a Codex thread is richer than a background job. It carries state, transcript history, and project metadata, so the workflow is still PowerShell-shaped but more conversational and recoverable.
 
 ## What It Adds
 
 - `Get-CodexProject`
 - `New-CodexProject`
 - `New-CodexPlaygroundProject`
+- `Start-CodexTask`
+- `Get-CodexTask`
+- `Wait-CodexTask`
+- `Receive-CodexTask`
+- `Resume-CodexTask`
+- `Remove-CodexTask`
 - `Get-CodexThread`
 - `Get-CodexTranscript`
 - `Show-CodexTranscript`
@@ -18,6 +36,53 @@ This folder adds the higher-level PowerShell UX on top of the raw Codex JSON-RPC
 - Extended `New-CodexThread`
 
 ## Core Flows
+
+The thread surface is designed to read like an operator workflow: start it, inspect it, read the output, resume it.
+
+Task-first workflow:
+
+```powershell
+$task = Start-CodexTask -Cwd . -Name repo-bootstrap -Prompt "Summarize this repo and propose next steps"
+Get-CodexTask
+Wait-CodexTask -Id $task.TaskId
+Receive-CodexTask -Id $task.TaskId
+Receive-CodexTask -Id $task.TaskId -Text
+Resume-CodexTask -Id $task.TaskId -Prompt "Turn that into a checklist"
+```
+
+Pipeline-style task workflow:
+
+```powershell
+Start-CodexTask -Cwd . -Prompt "Summarize this repo" |
+  Wait-CodexTask |
+  Receive-CodexTask -Text
+```
+
+Live tail for long-running work:
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Read the last 2 issues and summarize" |
+  Wait-CodexTask -Tail -TimeoutSec 900 |
+  Receive-CodexTask -Text
+```
+
+Live operator telemetry:
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Inspect this workspace and explain what you're doing" |
+  Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands -TimeoutSec 900 |
+  Receive-CodexTask -Text
+```
+
+```powershell
+Receive-CodexTask -Id $task.TaskId -Transcript -ShowReasoning -ShowTools -ShowCommands
+```
+
+Create a working folder on demand:
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-investigation -CreateCwd -Prompt "Set up a plan for this workspace"
+```
 
 List projects:
 
@@ -145,6 +210,11 @@ It does not currently delete the remote Codex thread from the app-server.
 
 ## Design Notes
 
+- `Start-CodexTask / Get-CodexTask / Wait-CodexTask / Receive-CodexTask` give you the job-style operator surface.
+- `Start-CodexTask -CreateCwd` lets task-first workflows create a new working folder without a separate setup step.
+- `Wait-CodexTask -Tail` shows new transcript items while the task is still running, and `-TimeoutSec` keeps the wait bounded when you want it.
+- `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces richer live telemetry about what the task is doing.
+- `Receive-CodexTask -Transcript -ShowReasoning -ShowTools -ShowCommands` returns that richer telemetry stream after the task completes.
 - `Get-CodexProject` always returns project objects.
 - `Get-CodexThread` always returns thread objects.
 - Wildcards are supported for project selection.

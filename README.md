@@ -8,7 +8,7 @@
 </div>
 <br/>
 
-**PSUnplugged is a PowerShell orchestration shell for OpenAI’s Codex App Server. It gives PowerShell users a terminal-native way to drive the Codex runtime while inheriting native support for conversation history, approvals, streamed agent events, AGENTS.md, MCP servers, skills, and plugins. Instead of rebuilding an agent stack from scratch, PSUnplugged makes PowerShell the control surface for reasoning, execution, and automation.**
+**PSUnplugged is a PowerShell orchestration shell for OpenAI's Codex App Server. It gives PowerShell users a terminal-native way to drive governed agent work while inheriting native support for conversation history, approvals, streamed agent events, AGENTS.md, MCP servers, skills, and plugins. Instead of rebuilding an agent stack from scratch, PSUnplugged gives agent workflows a legible PowerShell surface for reasoning, execution, and automation.**
 
 
 <!--
@@ -36,6 +36,8 @@ AI Agent Forge is a community for PowerShell developers stepping into the agenti
 ## Why
 
 The IDE with a side-panel chat window is a fossil. The future is agentic workflows running wherever your code runs — including the terminal you already have open.
+
+PowerShell already taught operators how to govern asynchronous work with `Start-Job`, `Get-Job`, and `Receive-Job`. PSUnplugged applies that same instinct to agent workflows: start the work, inspect the work, read the latest useful output, and resume when needed.
 
 PSUnplugged talks directly to the Codex App Server over JSON-RPC via stdio. It gives you a first-class agentic experience from pure PowerShell, on any machine, in any pipeline.
 
@@ -132,6 +134,51 @@ $r2 = Invoke-CodexTurn -Session $session -ThreadId $thread.id -Text "Now explain
 Stop-CodexSession -Session $session
 ```
 
+**Task-first workflow**
+
+```powershell
+$task = Start-CodexTask -Cwd (Get-Location).Path -Name repo-tour -Prompt "List the files here and explain what each one does"
+
+Get-CodexTask
+Wait-CodexTask -Id $task.TaskId
+Receive-CodexTask -Id $task.TaskId -Text
+Resume-CodexTask -Id $task.TaskId -Prompt "Now turn that into a checklist"
+```
+
+**Pipeline-style task workflow**
+
+```powershell
+Start-CodexTask -Cwd . -Prompt "Summarize this repo" |
+  Wait-CodexTask |
+  Receive-CodexTask -Text
+```
+
+**Live tail for long-running work**
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Read the last 2 issues and summarize" |
+  Wait-CodexTask -Tail -TimeoutSec 900 |
+  Receive-CodexTask -Text
+```
+
+**Live operator telemetry**
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Inspect this workspace and explain what you're doing" |
+  Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands -TimeoutSec 900 |
+  Receive-CodexTask -Text
+```
+
+```powershell
+Receive-CodexTask -Id $task.TaskId -Transcript -ShowReasoning -ShowTools -ShowCommands
+```
+
+**Create a working folder on demand**
+
+```powershell
+Start-CodexTask -Cwd .\scratch\repo-notes -CreateCwd -Prompt "Create a working plan for this new folder"
+```
+
 **Slash commands inside the chat REPL**
 
 ```
@@ -156,6 +203,38 @@ These values are also exposed by `New-CodexThread` in `PSUnplugged.psm1` as:
 
 - `-ApprovalPolicy`
 - `-SandboxType`
+
+## PowerShell Mental Model
+
+PSUnplugged works best when you think about agent work the way PowerShell already treats jobs.
+
+- `Start-CodexSession` is the connected runtime context for the current shell.
+- `Start-CodexTask` is the task-first operator surface when you want job-style language.
+- `New-CodexThread` starts a unit of agent work in that runtime.
+- `Get-CodexTask` is the task-first inspection view.
+- `Get-CodexThread` and `Get-CodexThreads` let you inspect what is running or available.
+- `Wait-CodexTask` blocks until a task reaches a terminal state like a final answer.
+- `Wait-CodexTask -Tail` streams new transcript items to the console while it waits.
+- `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces live operator telemetry from the task rollout.
+- `Receive-CodexTask -Transcript -ShowReasoning -ShowTools -ShowCommands` returns the richer telemetry stream after the task finishes.
+- `Wait-CodexTask -TimeoutSec <n>` gives you a clean escape hatch for long-running work.
+- `Receive-CodexTask` gives you the latest useful output, or the full transcript when you ask for it.
+- `Get-CodexTranscript` is the current "receive the useful output" view for a thread.
+- `Resume-CodexTask` lets you continue the same unit of work with another prompt.
+- `Start-CodexTask -CreateCwd` can create a missing working folder before the task starts.
+- `Enter-CodexThread` and `Resume-CodexThread` let you pick work back up.
+
+That means the module is not positioning threads as disposable chat tabs. It is treating them as managed work with lifecycle, state, and recoverable history.
+
+In short:
+
+```powershell
+Start-CodexTask "Inspect this repo and propose next steps"
+Get-CodexTask
+Wait-CodexTask
+Receive-CodexTask
+Resume-CodexTask -Id <task-id> -Prompt "Turn that into an action plan"
+```
 
 ---
 
@@ -227,7 +306,7 @@ The Codex App Server isn't just a model endpoint — it's a full agentic runtime
   - Skills and AGENTS.md stack: global instructions + repo-level instructions + skills are all merged into the agent's context at session start
 - **Provider-agnostic** — swap models without changing client code
 
-PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the cloud version of the app-server, the same code points at a URL instead of a local process.
+PSUnplugged is the PowerShell binding to that runtime. MCP gives the agent tools; PSUnplugged gives the operator a PowerShell-native way to govern the work. When OpenAI ships the cloud version of the app-server, the same code points at a URL instead of a local process.
 
 ---
 
