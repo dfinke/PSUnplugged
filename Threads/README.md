@@ -42,9 +42,10 @@ The thread surface is designed to read like an operator workflow: start it, insp
 Task-first workflow:
 
 ```powershell
-$task = Start-CodexTask -Cwd . -Name repo-bootstrap -Prompt "Summarize this repo and propose next steps"
-Get-CodexTask
-Wait-CodexTask -Id $task.TaskId
+$pending = Start-CodexTask -Cwd . -Name repo-bootstrap -Prompt "Summarize this repo and propose next steps"
+$pending | Get-CodexTask
+$task = $pending | Wait-CodexTask
+Get-CodexTask -ActiveOnly
 Receive-CodexTask -Id $task.TaskId
 Receive-CodexTask -Id $task.TaskId -Text
 Resume-CodexTask -Id $task.TaskId -Prompt "Turn that into a checklist"
@@ -211,6 +212,7 @@ It does not currently delete the remote Codex thread from the app-server.
 ## Design Notes
 
 - `Start-CodexTask / Get-CodexTask / Wait-CodexTask / Receive-CodexTask` give you the job-style operator surface.
+- `Get-CodexTask` returns cataloged task history by default, and `-ActiveOnly` keeps the view focused on tasks that are still in play.
 - `Start-CodexTask -CreateCwd` lets task-first workflows create a new working folder without a separate setup step.
 - `Wait-CodexTask -Tail` shows new transcript items while the task is still running, and `-TimeoutSec` keeps the wait bounded when you want it.
 - `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces richer live telemetry about what the task is doing.
