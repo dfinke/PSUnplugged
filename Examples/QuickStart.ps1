@@ -53,10 +53,13 @@ Stop-CodexSession -Session $session
 
 Write-Host "`n=== Example 2b: Task Workflow ===" -ForegroundColor Cyan
 
-$task = Start-CodexTask -Cwd (Get-Location).Path -Name "repo-tour" -Prompt "List the files in this directory and explain what each one does"
-Write-Host "Started task:" $task.TaskId
+$pending = Start-CodexTask -Cwd (Get-Location).Path -Name "repo-tour" -Prompt "List the files in this directory and explain what each one does"
+Write-Host "Started task handle:" $pending.Id
 
-$null = Wait-CodexTask -Id $task.TaskId
+$pending | Get-CodexTask | Out-Null
+
+$task = $pending | Wait-CodexTask
+Write-Host "Resolved task:" $task.TaskId
 
 $latest = Receive-CodexTask -Id $task.TaskId
 Write-Host "Latest output:`n$($latest.Text)"
