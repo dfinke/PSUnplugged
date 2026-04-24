@@ -4116,6 +4116,63 @@ function Get-CodexTaskDiagnosticErrorMessage {
         return $errorMessage
     }
 
+    $taskId = Resolve-CodexTaskIdentifier -InputObject $Task
+    if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+        $createdSession = $false
+        $effectiveSession = $Session
+        try {
+            if (-not $effectiveSession) {
+                $effectiveSession = Start-CodexSession
+                $createdSession = $true
+            }
+
+            $threadResult = Send-CodexRequest -Session $effectiveSession -Method 'thread/read' -Params @{
+                threadId     = $taskId
+                includeTurns = $true
+            }
+            $turns = @($threadResult.thread.turns)
+            $turn = if ($turns.Count -gt 0) { $turns[-1] } else { $null }
+            if ($turn) {
+                $turnStatus = [string](Get-CodexFirstValue -InputObject $turn -PropertyName @('status', 'Status'))
+                $turnError = Get-CodexFirstValue -InputObject $turn -PropertyName @('error', 'Error')
+                $turnErrorMessage = [string](Get-CodexFirstValue -InputObject $turnError -PropertyName @('message', 'Message'))
+                $itemTypes = @($turn.items | ForEach-Object { [string](Get-CodexFirstValue -InputObject $_ -PropertyName @('type', 'Type')) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+
+                if (-not [string]::IsNullOrWhiteSpace($turnErrorMessage)) {
+                    return $turnErrorMessage
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($turnStatus) -or $itemTypes.Count -gt 0) {
+                    $parts = [System.Collections.Generic.List[string]]::new()
+                    $parts.Add('Task completed with no assistant output.')
+                    if (-not [string]::IsNullOrWhiteSpace($turnStatus)) {
+                        $parts.Add("Turn status: $turnStatus.")
+                    }
+                    else {
+                        $parts.Add('Turn status: unknown.')
+                    }
+
+                    if ($itemTypes.Count -gt 0) {
+                        $parts.Add('Recorded items: ' + ($itemTypes -join ', ') + '.')
+                    }
+                    else {
+                        $parts.Add('Recorded items: none.')
+                    }
+
+                    $parts.Add('Codex did not report an explicit error.')
+                    return ($parts -join ' ')
+                }
+            }
+        }
+        catch {
+        }
+        finally {
+            if ($createdSession -and $effectiveSession) {
+                Stop-CodexSession -Session $effectiveSession
+            }
+        }
+    }
+
     $model = [string](Get-CodexFirstValue -InputObject $Task -PropertyName @('Model', 'model'))
     if ([string]::IsNullOrWhiteSpace($model)) {
         return $errorMessage
@@ -4638,6 +4695,14 @@ function Start-PSUnpluggedTaskWorkerProcess {
         [switch]$CreateCwd
     )
 
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        $candidate = ($Prompt -replace '\s+', ' ').Trim()
+        if ($candidate.Length -gt 120) {
+            $candidate = $candidate.Substring(0, 120).Trim()
+        }
+        $Name = $candidate
+    }
+
     $modulePath = Join-Path (Get-PSUnpluggedModuleRoot) 'PSUnplugged.psd1'
     $workerRoot = Join-Path (Get-PSUnpluggedDataRoot) 'task-workers'
     if (-not (Test-Path -LiteralPath $workerRoot)) {
@@ -4652,6 +4717,7 @@ function Start-PSUnpluggedTaskWorkerProcess {
     $stderrPath = Join-Path $workerRoot "$workerId.stderr.log"
 
     $payload = [ordered]@{
+        WorkerId       = $workerId
         Model          = $Model
         Cwd            = $Cwd
         ApprovalPolicy = $ApprovalPolicy
@@ -4719,6 +4785,15 @@ Write-Output 'WORKER_END'
     }
 
     $process = Start-Process @startParams
+    try {
+        $payload.WorkerProcessId = $process.Id
+        $payload.WorkerStartedAt = (Get-Date).ToString('o')
+        Set-Content -LiteralPath $paramsPath -Value ($payload | ConvertTo-Json -Depth 6 -Compress) -Encoding utf8
+    }
+    catch {
+        # Best effort only; worker listing uses this when available.
+    }
+
     return [PSCustomObject]@{
         Process    = $process
         ParamsPath = $paramsPath
@@ -4727,6 +4802,119 @@ Write-Output 'WORKER_END'
         StdOutPath = $stdoutPath
         StdErrPath = $stderrPath
     }
+}
+
+function Get-PSUnpluggedTaskWorkerHandles {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$ProjectPath,
+        [int]$MaxAgeHours = 24
+    )
+
+    $workerRoot = Join-Path (Get-PSUnpluggedDataRoot) 'task-workers'
+    if (-not (Test-Path -LiteralPath $workerRoot)) {
+        return @()
+    }
+
+    $now = Get-Date
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($paramsFile in @(Get-ChildItem -LiteralPath $workerRoot -Filter '*.params.json' -File -ErrorAction SilentlyContinue)) {
+        if ($MaxAgeHours -gt 0) {
+            $ageHours = ($now - $paramsFile.LastWriteTime).TotalHours
+            if ($ageHours -gt $MaxAgeHours) {
+                continue
+            }
+        }
+
+        $payload = $null
+        try {
+            $payload = Get-Content -LiteralPath $paramsFile.FullName -Raw | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+        if ($null -eq $payload) {
+            continue
+        }
+
+        $readyFilePath = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('ReadyFilePath', 'readyFilePath'))
+        if (-not [string]::IsNullOrWhiteSpace($readyFilePath) -and (Test-Path -LiteralPath $readyFilePath)) {
+            continue
+        }
+
+        $cwd = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('Cwd', 'cwd'))
+        if ([string]::IsNullOrWhiteSpace($cwd)) {
+            continue
+        }
+
+        $projectIdentity = $null
+        try {
+            $projectIdentity = Get-CodexProjectIdentity -Path $cwd
+        }
+        catch {
+            $projectIdentity = $null
+        }
+
+        $effectiveProjectPath = if ($projectIdentity -and $projectIdentity.Path) { [string]$projectIdentity.Path } else { $cwd }
+        if (-not [string]::IsNullOrWhiteSpace($ProjectPath) -and $effectiveProjectPath -ne $ProjectPath) {
+            continue
+        }
+
+        $workerId = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('WorkerId', 'workerId'))
+        if ([string]::IsNullOrWhiteSpace($workerId)) {
+            $workerId = [System.IO.Path]::GetFileNameWithoutExtension([System.IO.Path]::GetFileNameWithoutExtension($paramsFile.Name))
+        }
+
+        $workerProcessId = $null
+        $workerProcessIdValue = Get-CodexFirstValue -InputObject $payload -PropertyName @('WorkerProcessId', 'workerProcessId')
+        if ($null -ne $workerProcessIdValue) {
+            try { $workerProcessId = [int]$workerProcessIdValue } catch { $workerProcessId = $null }
+        }
+
+        $isAlive = $false
+        $workerProcessName = $null
+        if ($workerProcessId) {
+            try {
+                $process = Get-Process -Id $workerProcessId -ErrorAction Stop
+                $isAlive = $true
+                $workerProcessName = $process.ProcessName
+            }
+            catch {
+                $isAlive = $false
+            }
+        }
+
+        if (-not $isAlive -and $workerProcessId) {
+            continue
+        }
+
+        $name = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('Name', 'name'))
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $name = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('Prompt', 'prompt'))
+        }
+
+        $stdoutPath = Join-Path $workerRoot "$workerId.stdout.log"
+        $stderrPath = Join-Path $workerRoot "$workerId.stderr.log"
+
+        $task = [PSCustomObject]@{
+            Id                = if ($workerProcessId) { 'pending-' + [string]$workerProcessId } else { 'pending' }
+            TaskId            = $null
+            ThreadId          = $null
+            Name              = $name
+            Project           = if ($projectIdentity -and $projectIdentity.Name) { [string]$projectIdentity.Name } else { (Split-Path -Leaf $effectiveProjectPath) }
+            Path              = $effectiveProjectPath
+            Status            = 'starting'
+            ReadyFilePath     = $readyFilePath
+            WorkerProcessId   = $workerProcessId
+            WorkerProcessName = $workerProcessName
+            WorkerStdOutPath  = [string]$stdoutPath
+            WorkerStdErrPath  = [string]$stderrPath
+        }
+        $task.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTask')
+        $results.Add($task)
+    }
+
+    return @($results)
 }
 
 function Start-CodexTask {
@@ -4842,7 +5030,11 @@ function Get-CodexTask {
     .SYNOPSIS
         Returns managed Codex tasks using task-first terminology.
     .DESCRIPTION
-        By default, returns the cataloged task history, including archived tasks.
+        By default, returns tasks associated with the current working directory.
+
+        Pass -Project '*' to list tasks across all projects, and -IncludeArchived
+        when you want archived task records included.
+
         Use -ActiveOnly to focus on tasks that are still in play.
     #>
     [CmdletBinding()]
@@ -4895,16 +5087,61 @@ function Get-CodexTask {
             return ($InputObject | ConvertTo-CodexTaskOutput -Session $Session)
         }
 
+        $hasProjectFilter =
+        $PSBoundParameters.ContainsKey('Project') -or
+        $PSBoundParameters.ContainsKey('ProjectKey') -or
+        $PSBoundParameters.ContainsKey('ProjectName') -or
+        $PSBoundParameters.ContainsKey('ProjectPathInput')
+
+        if (
+            ($null -eq $InputObject) -and
+            (-not $threadParams.ContainsKey('Id')) -and
+            (-not $hasProjectFilter)
+        ) {
+            $threadParams.Project = (Get-Location).Path
+        }
+
         if ($PSBoundParameters.ContainsKey('IncludeArchived')) {
             if ($IncludeArchived) {
                 $threadParams.IncludeArchived = $true
             }
         }
-        elseif (-not $ActiveOnly) {
-            $threadParams.IncludeArchived = $true
+
+        $pendingWorkerTasks = @()
+        if (-not $threadParams.ContainsKey('Id')) {
+            $workerProjectPath = $null
+            if ($threadParams.ContainsKey('Project')) {
+                $workerProjectTerm = [string]$threadParams.Project
+                $hasWildcard = $workerProjectTerm.Contains('*') -or $workerProjectTerm.Contains('?') -or $workerProjectTerm.Contains('[')
+                if ((-not $hasWildcard) -and (Test-Path -LiteralPath $workerProjectTerm)) {
+                    try {
+                        $workerProjectIdentity = Get-CodexProjectIdentity -Path $workerProjectTerm
+                        $workerProjectPath = [string]$workerProjectIdentity.Path
+                    }
+                    catch {
+                        $workerProjectPath = $null
+                    }
+                }
+            }
+
+            $pendingWorkerTasks = @(Get-PSUnpluggedTaskWorkerHandles -ProjectPath $workerProjectPath)
         }
 
-        Get-CodexThread @threadParams | ConvertTo-CodexTaskOutput -Session $Session
+        $tasks = @($pendingWorkerTasks + @(Get-CodexThread @threadParams | ConvertTo-CodexTaskOutput -Session $Session))
+        if ($ActiveOnly) {
+            $tasks = @(
+                $tasks | Where-Object {
+                    $status = ConvertTo-CodexTaskTerminalStatus -Status ([string](Get-CodexFirstValue -InputObject $_ -PropertyName @('Status', 'status')))
+                    -not ($status -in @('completed', 'failed', 'error', 'canceled', 'archived'))
+                }
+            )
+        }
+
+        if ($Limit -gt 0) {
+            $tasks = @($tasks | Select-Object -First $Limit)
+        }
+
+        return $tasks
     }
 }
 
