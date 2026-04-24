@@ -212,7 +212,8 @@ It does not currently delete the remote Codex thread from the app-server.
 ## Design Notes
 
 - `Start-CodexTask / Get-CodexTask / Wait-CodexTask / Receive-CodexTask` give you the job-style operator surface.
-- `Get-CodexTask` returns cataloged task history by default, and `-ActiveOnly` keeps the view focused on tasks that are still in play.
+- `Get-CodexTask` defaults to the current working directory (`-Project '*'` lists everything), and `-ActiveOnly` keeps the view focused on tasks that are still in play.
+- `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
 - `Start-CodexTask -CreateCwd` lets task-first workflows create a new working folder without a separate setup step.
 - `Wait-CodexTask -Tail` shows new transcript items while the task is still running, and `-TimeoutSec` keeps the wait bounded when you want it.
 - `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces richer live telemetry about what the task is doing.

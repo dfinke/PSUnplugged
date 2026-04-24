@@ -212,8 +212,9 @@ PSUnplugged works best when you think about agent work the way PowerShell alread
 - `Start-CodexSession` is the connected runtime context for the current shell.
 - `Start-CodexTask` is the task-first operator surface when you want job-style language.
 - `New-CodexThread` starts a unit of agent work in that runtime.
-- `Get-CodexTask` is the task-first inspection view and returns cataloged task history by default.
+- `Get-CodexTask` is the task-first inspection view and defaults to the current working directory (`-Project '*'` lists everything).
 - `Get-CodexTask -ActiveOnly` narrows that view to tasks that are still in play.
+- `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
 - `Get-CodexThread` and `Get-CodexThreads` let you inspect what is running or available.
 - `Wait-CodexTask` blocks until a task reaches a terminal state like a final answer.
 - `Wait-CodexTask -Tail` streams new transcript items to the console while it waits.
