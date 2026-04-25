@@ -159,7 +159,7 @@ Write-Host @"
 
   `$session = Start-CodexSession
   `$result  = Send-CodexRequest -Session `$session -Method "thread/start" -Params @{
-      model = "gpt-5.1-codex"
+      model = "gpt-5.2"
   }
   `$events  = Read-CodexNotifications -Session `$session -TimeoutMs 5000
   Stop-CodexSession -Session `$session
