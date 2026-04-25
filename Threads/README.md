@@ -212,9 +212,12 @@ It does not currently delete the remote Codex thread from the app-server.
 ## Design Notes
 
 - `Start-CodexTask / Get-CodexTask / Wait-CodexTask / Receive-CodexTask` give you the job-style operator surface.
+- `Start-CodexTask` defaults to `gpt-5.2`, matching the minimum supported Codex runtime model.
 - `Get-CodexTask` defaults to the current working directory (`-Project '*'` lists everything), and `-ActiveOnly` keeps the view focused on tasks that are still in play.
 - `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
+- `Get-CodexTask` surfaces task errors in the default table when a worker stops before Codex reports completion.
 - `Start-CodexTask -CreateCwd` lets task-first workflows create a new working folder without a separate setup step.
+- `Start-CodexTask -TurnTimeoutSec <n>` controls the task worker's Codex turn wait; the default is 900 seconds.
 - `Wait-CodexTask -Tail` shows new transcript items while the task is still running, and `-TimeoutSec` keeps the wait bounded when you want it.
 - `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces richer live telemetry about what the task is doing.
 - `Receive-CodexTask -Transcript -ShowReasoning -ShowTools -ShowCommands` returns that richer telemetry stream after the task completes.

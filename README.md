@@ -82,11 +82,11 @@ Examples/
    npm i -g @openai/codex
    ```
 4. **Authenticate** — choose one:
-   - **ChatGPT account** (free tier, supports `gpt-5.1-codex` only):
+   - **ChatGPT account** with access to the Codex runtime model used by this module:
      ```powershell
      codex login
      ```
-   - **OpenAI API key** (required for `gpt-4.1`, `gpt-4o`, etc.) — pass it directly at runtime, no login needed:
+   - **OpenAI API key** — pass it directly at runtime, no login needed:
      ```powershell
      .\Examples\Start-AgentChat.ps1 -ApiKey $env:OPENAI_API_KEY
      ```
@@ -107,8 +107,8 @@ Examples/
 # ChatGPT account (default model)
 .\Examples\Start-AgentChat.ps1
 
-# OpenAI API key — use any model
-.\Examples\Start-AgentChat.ps1 -Model gpt-4.1 -ApiKey $env:OPENAI_API_KEY
+# OpenAI API key
+.\Examples\Start-AgentChat.ps1 -Model gpt-5.2 -ApiKey $env:OPENAI_API_KEY
 ```
 
 **One-liner from a script**
@@ -211,10 +211,13 @@ PSUnplugged works best when you think about agent work the way PowerShell alread
 
 - `Start-CodexSession` is the connected runtime context for the current shell.
 - `Start-CodexTask` is the task-first operator surface when you want job-style language.
+- `Start-CodexTask` defaults to `gpt-5.2`, matching the minimum supported Codex runtime model.
 - `New-CodexThread` starts a unit of agent work in that runtime.
 - `Get-CodexTask` is the task-first inspection view and defaults to the current working directory (`-Project '*'` lists everything).
 - `Get-CodexTask -ActiveOnly` narrows that view to tasks that are still in play.
 - `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
+- `Get-CodexTask` surfaces task errors in the default table when a worker stops before Codex reports completion.
+- `Start-CodexTask -TurnTimeoutSec <n>` controls the task worker's Codex turn wait; the default is 900 seconds.
 - `Get-CodexThread` and `Get-CodexThreads` let you inspect what is running or available.
 - `Wait-CodexTask` blocks until a task reaches a terminal state like a final answer.
 - `Wait-CodexTask -Tail` streams new transcript items to the console while it waits.
@@ -327,7 +330,7 @@ PSUnplugged is the PowerShell binding to that runtime. MCP gives the agent tools
 
 ## Known Limitations
 - Currently read-only (no file writes or command execution — approval flow coming soon via [AI Agent Forge](https://forms.gle/gvw8cU2pgFeXWMNZA))
-- Tested primarily with OpenAI-hosted Codex models (gpt-5.1-codex via ChatGPT login, or API key for others)
+- Tested primarily with Codex models such as `gpt-5.2` or newer
 - Multi-provider support (Ollama, xAI, etc.) is experimental and requires manual config.toml tweaks — not documented here yet
 
 ## Built With
