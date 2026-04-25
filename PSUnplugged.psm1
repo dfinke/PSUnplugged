@@ -403,7 +403,7 @@ function New-CodexThread {
     .SYNOPSIS
         Creates a new Codex conversation thread.
     .PARAMETER Model
-        Model to use (default: gpt-5.1-codex).
+        Model to use (default: gpt-5.2).
     .PARAMETER Cwd
         Working directory for the agent.
     .PARAMETER ApprovalPolicy
@@ -422,7 +422,7 @@ function New-CodexThread {
     [CmdletBinding()]
     param(
         [PSCustomObject]$Session,
-        [string]$Model = "gpt-5.1-codex",
+        [string]$Model = "gpt-5.2",
         [Parameter(ValueFromPipeline = $true, DontShow = $true)]
         $InputObject,
         [Alias('Path')]
@@ -471,17 +471,18 @@ function New-CodexThread {
         }
 
         $useManagedMode =
-            $managedParams.ContainsKey('Prompt') -or
-            $managedParams.ContainsKey('Name') -or
-            $managedParams.ContainsKey('Tags') -or
-            $PassThruSession -or
-            ($null -ne $InputObject) -or
-            -not $managedParams.ContainsKey('Session')
+        $managedParams.ContainsKey('Prompt') -or
+        $managedParams.ContainsKey('Name') -or
+        $managedParams.ContainsKey('Tags') -or
+        $PassThruSession -or
+        ($null -ne $InputObject) -or
+        -not $managedParams.ContainsKey('Session')
 
         if ($useManagedMode) {
             New-PSUnpluggedManagedThread @managedParams
         }
         else {
+            $Model = Resolve-CodexRequestedModel -Session $Session -Model $Model
             $params = @{
                 model          = $Model
                 approvalPolicy = $ApprovalPolicy
@@ -562,6 +563,8 @@ function Invoke-CodexTurn {
     if ($ImageUrl) { $input += @{ type = "image"; url = $ImageUrl } }
     if ($LocalImagePath) { $input += @{ type = "localImage"; path = $LocalImagePath } }
 
+    $Model = Resolve-CodexRequestedModel -Session $Session -Model $Model
+
     $params = @{
         threadId = $ThreadId
         input    = $input
@@ -606,9 +609,9 @@ function Invoke-CodexTurn {
 
                     $recordAgentMessages = @(
                         $recordItems |
-                            Where-Object { $_.type -eq 'agentMessage' } |
-                            ForEach-Object { [string]$_.text } |
-                            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                        Where-Object { $_.type -eq 'agentMessage' } |
+                        ForEach-Object { [string]$_.text } |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
                     )
                     if ($recordAgentMessages.Count -gt 0) {
                         $agentText = ($recordAgentMessages -join "`n`n")
@@ -639,12 +642,12 @@ function Invoke-CodexQuestion {
     param(
         [Parameter(Mandatory, ValueFromPipeline)][PSCustomObject]$Session,
         [Parameter(Mandatory)][string]$Text,
-        [string]$Model = "gpt-5.1-codex",
+        [string]$Model = "gpt-5.2",
         [string]$Cwd
     )
 
     $thread = New-CodexThread -Session $Session -Model $Model -Cwd $Cwd
-    $result = Invoke-CodexTurn -Session $Session -ThreadId $thread.id -Text $Text
+    $result = Invoke-CodexTurn -Session $Session -ThreadId $thread.id -Text $Text -Model $Model
     return $result.AgentText
 }
 
