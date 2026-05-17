@@ -57,6 +57,7 @@ Threads/
 Examples/
   Start-AgentChat.ps1    # interactive REPL — multi-turn chat, streaming, slash commands
   QuickStart.ps1         # working examples for every feature
+  Start-StageReadyDemos.ps1 # launcher for stage-ready task, transcript, and artifact demos
 ```
 
 | File | What it does |
@@ -67,6 +68,7 @@ Examples/
 | `Threads/README.md` | Usage guide for project-aware thread management |
 | `Examples/Start-AgentChat.ps1` | Interactive REPL — multi-turn chat, streaming, slash commands |
 | `Examples/QuickStart.ps1` | Working examples for every feature |
+| `Examples/Start-StageReadyDemos.ps1` | Launcher for stage-ready task, transcript, fan-out, and artifact demos |
 | `ShowMarkdown.psm1` | Terminal Markdown renderer — headers, code blocks, tables with box-drawing chars |
 
 ---
@@ -142,6 +144,7 @@ $pending | Get-CodexTask
 $task = $pending | Wait-CodexTask
 
 Get-CodexTask -ActiveOnly
+Receive-CodexTask -Id $task.TaskId
 Receive-CodexTask -Id $task.TaskId -Text
 Resume-CodexTask -Id $task.TaskId -Prompt "Now turn that into a checklist"
 ```
@@ -152,6 +155,19 @@ Resume-CodexTask -Id $task.TaskId -Prompt "Now turn that into a checklist"
 Start-CodexTask -Cwd . -Prompt "Summarize this repo" |
   Wait-CodexTask |
   Receive-CodexTask -Text
+```
+
+You can also pipe multiple prompt strings into `Start-CodexTask` while supplying a shared working directory:
+
+```powershell
+$tasks = @(
+  "Review error handling"
+  "Add README examples"
+  "Write Pester tests"
+) | Start-CodexTask -Cwd .
+
+$tasks | Get-CodexTask
+$tasks | Receive-CodexTask -Transcript -ShowTelemetry
 ```
 
 **Live tail for long-running work**
@@ -166,12 +182,31 @@ Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Read the last 2 issu
 
 ```powershell
 Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Inspect this workspace and explain what you're doing" |
-  Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands -TimeoutSec 900 |
+  Wait-CodexTask -Tail -ShowAll -TimeoutSec 900 |
   Receive-CodexTask -Text
 ```
 
 ```powershell
-Receive-CodexTask -Id $task.TaskId -Transcript -ShowReasoning -ShowTools -ShowCommands
+Receive-CodexTask -Id $task.TaskId -Details
+```
+
+**Stage-ready demos**
+
+```powershell
+# See the demo menu and copy-ready commands
+.\Examples\Start-StageReadyDemos.ps1
+
+# Turn the repo into an executive-ready technical brief
+.\Examples\Start-BoardroomBriefDemo.ps1 -Cwd .
+
+# Launch parallel specialist agents and collect the results
+.\Examples\Start-AgentSwarmDemo.ps1 -Cwd .
+
+# Prove agent work is recoverable through threads and transcripts
+.\Examples\Show-AgentFlightRecorderDemo.ps1 -Project .
+
+# Create a scratch workspace and produce demo artifacts
+.\Examples\Start-ArtifactSprintDemo.ps1
 ```
 
 **Create a working folder on demand**
@@ -221,10 +256,12 @@ PSUnplugged works best when you think about agent work the way PowerShell alread
 - `Get-CodexThread` and `Get-CodexThreads` let you inspect what is running or available.
 - `Wait-CodexTask` blocks until a task reaches a terminal state like a final answer.
 - `Wait-CodexTask -Tail` streams new transcript items to the console while it waits.
-- `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces live operator telemetry from the task rollout.
-- `Receive-CodexTask -Transcript -ShowReasoning -ShowTools -ShowCommands` returns the richer telemetry stream after the task finishes.
+- `Wait-CodexTask -Tail -ShowAll` surfaces live operator telemetry from the task rollout.
+- `Receive-CodexTask -Details` returns the full transcript plus reasoning, tools, and commands after the task finishes.
 - `Wait-CodexTask -TimeoutSec <n>` gives you a clean escape hatch for long-running work.
-- `Receive-CodexTask` gives you the latest useful output, or the full transcript when you ask for it.
+- `Receive-CodexTask` gives you a compact latest-output summary by default.
+- `Receive-CodexTask -Text` returns the full latest assistant text.
+- `Receive-CodexTask -Transcript` returns the full transcript. Add `-ShowAll` for reasoning, tools, and commands, or use `-Details` as the short form for `-Transcript -ShowAll`. In the default summary view, telemetry switches are ignored so the summary stays focused on the latest assistant output or task state.
 - `Get-CodexTranscript` is the current "receive the useful output" view for a thread.
 - `Resume-CodexTask` lets you continue the same unit of work with another prompt.
 - `Start-CodexTask -CreateCwd` can create a missing working folder before the task starts.
