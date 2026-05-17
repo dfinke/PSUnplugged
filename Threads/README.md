@@ -59,6 +59,19 @@ Start-CodexTask -Cwd . -Prompt "Summarize this repo" |
   Receive-CodexTask -Text
 ```
 
+Pipe multiple prompts into the same working directory:
+
+```powershell
+$tasks = @(
+  "Review error handling"
+  "Add README examples"
+  "Write Pester tests"
+) | Start-CodexTask -Cwd .
+
+$tasks | Get-CodexTask
+$tasks | Receive-CodexTask -Transcript -ShowTelemetry
+```
+
 Live tail for long-running work:
 
 ```powershell
@@ -71,12 +84,12 @@ Live operator telemetry:
 
 ```powershell
 Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Inspect this workspace and explain what you're doing" |
-  Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands -TimeoutSec 900 |
+  Wait-CodexTask -Tail -ShowAll -TimeoutSec 900 |
   Receive-CodexTask -Text
 ```
 
 ```powershell
-Receive-CodexTask -Id $task.TaskId -Transcript -ShowReasoning -ShowTools -ShowCommands
+Receive-CodexTask -Id $task.TaskId -Details
 ```
 
 Create a working folder on demand:
@@ -219,8 +232,13 @@ It does not currently delete the remote Codex thread from the app-server.
 - `Start-CodexTask -CreateCwd` lets task-first workflows create a new working folder without a separate setup step.
 - `Start-CodexTask -TurnTimeoutSec <n>` controls the task worker's Codex turn wait; the default is 900 seconds.
 - `Wait-CodexTask -Tail` shows new transcript items while the task is still running, and `-TimeoutSec` keeps the wait bounded when you want it.
-- `Wait-CodexTask -Tail -ShowReasoning -ShowTools -ShowCommands` surfaces richer live telemetry about what the task is doing.
-- `Receive-CodexTask -Transcript -ShowReasoning -ShowTools -ShowCommands` returns that richer telemetry stream after the task completes.
+- `Wait-CodexTask -Tail -ShowAll` surfaces richer live telemetry about what the task is doing.
+- `Receive-CodexTask` gives you a compact latest-output summary by default.
+- `Receive-CodexTask -Text` returns the full latest assistant text.
+- `Receive-CodexTask -Details` returns the full transcript plus reasoning, tools, and commands after the task completes.
+- `Receive-CodexTask -Transcript -ShowAll` is still supported when you prefer explicit switches.
+- `-ShowReasoning`, `-ShowTools`, and `-ShowCommands` remain available when you only want one telemetry slice.
+- In the default summary view, telemetry switches are ignored so the summary stays focused on the latest assistant output or task state.
 - `Get-CodexProject` always returns project objects.
 - `Get-CodexThread` always returns thread objects.
 - Wildcards are supported for project selection.
