@@ -48,6 +48,38 @@ Write-Host "Turn 2:`n$($r2.AgentText)"
 Stop-CodexSession -Session $session
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Example 2b: Task-first workflow
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write-Host "`n=== Example 2b: Task Workflow ===" -ForegroundColor Cyan
+
+$pending = Start-CodexTask -Cwd (Get-Location).Path -Name "repo-tour" -Prompt "List the files in this directory and explain what each one does"
+Write-Host "Started task handle:" $pending.Id
+
+$pending | Get-CodexTask | Out-Null
+
+$task = $pending | Wait-CodexTask
+Write-Host "Resolved task:" $task.TaskId
+
+$latest = Receive-CodexTask -Id $task.TaskId
+Write-Host "Latest output:`n$($latest.Text)"
+
+$detailedTranscript = Receive-CodexTask -Id $task.TaskId -Transcript -ShowReasoning -ShowTools -ShowCommands
+Write-Host "Detailed transcript entries:" $detailedTranscript.Count
+
+$followUp = Resume-CodexTask -Id $task.TaskId -Prompt "Now group those files by purpose"
+Write-Host "Follow-up:`n$($followUp.Result.AgentText)"
+
+Write-Host "`nPipeline style:`n" -ForegroundColor DarkGray
+Start-CodexTask -Cwd (Get-Location).Path -Prompt "Summarize this repo in one paragraph" |
+    Wait-CodexTask |
+    Receive-CodexTask -Text |
+    Write-Host
+
+Write-Host "`nLive tail style:`n" -ForegroundColor DarkGray
+Write-Host "(Use -Tail to watch commentary arrive, -ShowReasoning/-ShowTools/-ShowCommands for richer telemetry, and -TimeoutSec to cap the wait.)" -ForegroundColor DarkGray
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Example 3: Run a sandboxed command
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -127,7 +159,7 @@ Write-Host @"
 
   `$session = Start-CodexSession
   `$result  = Send-CodexRequest -Session `$session -Method "thread/start" -Params @{
-      model = "gpt-5.1-codex"
+      model = "gpt-5.2"
   }
   `$events  = Read-CodexNotifications -Session `$session -TimeoutMs 5000
   Stop-CodexSession -Session `$session

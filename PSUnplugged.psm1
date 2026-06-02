@@ -341,20 +341,28 @@ function Read-CodexNotifications {
     param(
         [Parameter(Mandatory)][PSCustomObject]$Session,
         [int]$TimeoutMs = 60000,
-        [switch]$WaitForTurnComplete
+        [switch]$WaitForTurnComplete,
+        [int]$PostCompletionDrainMs = 1000
     )
 
     $events = [System.Collections.Generic.List[PSObject]]::new()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $completionDrain = $null
 
     while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        if ($completionDrain -and $completionDrain.ElapsedMilliseconds -ge $PostCompletionDrainMs) {
+            break
+        }
+
         $remaining = $TimeoutMs - [int]$sw.ElapsedMilliseconds
         if ($remaining -le 0) { break }
 
         # Wait in short slices but keep using a single in-flight read task.
-        $slice = [Math]::Min(500, $remaining)
+        $slice = if ($completionDrain) { [Math]::Min(100, $remaining) } else { [Math]::Min(500, $remaining) }
         $read = Receive-CodexLine -Session $Session -TimeoutMs $slice
-        if (-not $read.HasLine) { continue }
+        if (-not $read.HasLine) {
+            continue
+        }
 
         $line = $read.Line
         if ($null -eq $line) { break }
@@ -377,7 +385,9 @@ function Read-CodexNotifications {
         }
 
         if ($WaitForTurnComplete -and $parsed.method -eq "turn/completed") {
-            break
+            if (-not $completionDrain) {
+                $completionDrain = [System.Diagnostics.Stopwatch]::StartNew()
+            }
         }
     }
 
@@ -393,7 +403,7 @@ function New-CodexThread {
     .SYNOPSIS
         Creates a new Codex conversation thread.
     .PARAMETER Model
-        Model to use (default: gpt-5.1-codex).
+        Model to use (default: gpt-5.2).
     .PARAMETER Cwd
         Working directory for the agent.
     .PARAMETER ApprovalPolicy
@@ -412,7 +422,7 @@ function New-CodexThread {
     [CmdletBinding()]
     param(
         [PSCustomObject]$Session,
-        [string]$Model = "gpt-5.1-codex",
+        [string]$Model = "gpt-5.2",
         [Parameter(ValueFromPipeline = $true, DontShow = $true)]
         $InputObject,
         [Alias('Path')]
@@ -461,17 +471,18 @@ function New-CodexThread {
         }
 
         $useManagedMode =
-            $managedParams.ContainsKey('Prompt') -or
-            $managedParams.ContainsKey('Name') -or
-            $managedParams.ContainsKey('Tags') -or
-            $PassThruSession -or
-            ($null -ne $InputObject) -or
-            -not $managedParams.ContainsKey('Session')
+        $managedParams.ContainsKey('Prompt') -or
+        $managedParams.ContainsKey('Name') -or
+        $managedParams.ContainsKey('Tags') -or
+        $PassThruSession -or
+        ($null -ne $InputObject) -or
+        -not $managedParams.ContainsKey('Session')
 
         if ($useManagedMode) {
             New-PSUnpluggedManagedThread @managedParams
         }
         else {
+            $Model = Resolve-CodexRequestedModel -Session $Session -Model $Model
             $params = @{
                 model          = $Model
                 approvalPolicy = $ApprovalPolicy
@@ -552,6 +563,8 @@ function Invoke-CodexTurn {
     if ($ImageUrl) { $input += @{ type = "image"; url = $ImageUrl } }
     if ($LocalImagePath) { $input += @{ type = "localImage"; path = $LocalImagePath } }
 
+    $Model = Resolve-CodexRequestedModel -Session $Session -Model $Model
+
     $params = @{
         threadId = $ThreadId
         input    = $input
@@ -563,7 +576,7 @@ function Invoke-CodexTurn {
     $turnId = $turnResult.turn.id
 
     # Stream events until turn/completed
-    $events = Read-CodexNotifications -Session $Session -TimeoutMs $TimeoutMs -WaitForTurnComplete
+    $events = Read-CodexNotifications -Session $Session -TimeoutMs $TimeoutMs -WaitForTurnComplete -PostCompletionDrainMs 1500
 
     # Extract the final turn state and agent text
     $completedEvent = $events | Where-Object { $_.method -eq "turn/completed" } | Select-Object -Last 1
@@ -572,6 +585,43 @@ function Invoke-CodexTurn {
 
     $items = $events | Where-Object { $_.method -eq "item/completed" } |
     ForEach-Object { $_.params.item }
+
+    if ($completedEvent) {
+        $hasAgentItem = @($items | Where-Object { $_.type -eq 'agentMessage' }).Count -gt 0
+        if ((-not $hasAgentItem) -or [string]::IsNullOrWhiteSpace($agentText)) {
+            try {
+                Start-Sleep -Milliseconds 500
+                $threadRecord = Send-CodexRequest -Session $Session -Method "thread/read" -Params @{
+                    threadId     = $ThreadId
+                    includeTurns = $true
+                }
+
+                $turnRecord = @($threadRecord.thread.turns | Where-Object { $_.id -eq $turnId }) | Select-Object -Last 1
+                if (-not $turnRecord) {
+                    $turnRecord = @($threadRecord.thread.turns) | Select-Object -Last 1
+                }
+
+                if ($turnRecord) {
+                    $recordItems = @($turnRecord.items)
+                    if ($recordItems.Count -gt 0) {
+                        $items = $recordItems
+                    }
+
+                    $recordAgentMessages = @(
+                        $recordItems |
+                        Where-Object { $_.type -eq 'agentMessage' } |
+                        ForEach-Object { [string]$_.text } |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                    )
+                    if ($recordAgentMessages.Count -gt 0) {
+                        $agentText = ($recordAgentMessages -join "`n`n")
+                    }
+                }
+            }
+            catch {
+            }
+        }
+    }
 
     return [PSCustomObject]@{
         TurnId    = $turnId
@@ -592,12 +642,12 @@ function Invoke-CodexQuestion {
     param(
         [Parameter(Mandatory, ValueFromPipeline)][PSCustomObject]$Session,
         [Parameter(Mandatory)][string]$Text,
-        [string]$Model = "gpt-5.1-codex",
+        [string]$Model = "gpt-5.2",
         [string]$Cwd
     )
 
     $thread = New-CodexThread -Session $Session -Model $Model -Cwd $Cwd
-    $result = Invoke-CodexTurn -Session $Session -ThreadId $thread.id -Text $Text
+    $result = Invoke-CodexTurn -Session $Session -ThreadId $thread.id -Text $Text -Model $Model
     return $result.AgentText
 }
 
@@ -680,12 +730,23 @@ function Get-CodexAccount {
 Export-ModuleMember -Function @(
     'Start-CodexSession'
     'Stop-CodexSession'
+    'Start-CodexTask'
     'New-CodexThread'
+    'Get-CodexApproval'
+    'Get-CodexArtifact'
+    'Get-CodexEvent'
+    'Get-CodexTask'
     'Get-CodexThread'
+    'ConvertTo-CodexTaskDashboardData'
+    'Receive-CodexTask'
+    'Wait-CodexTask'
     'Get-CodexTranscript'
+    'Show-CodexTaskDashboard'
     'Show-CodexTranscript'
     'Set-CodexThread'
+    'Remove-CodexTask'
     'Remove-CodexThread'
+    'Resume-CodexTask'
     'Enter-CodexThread'
     'Resume-CodexThread'
     'Invoke-CodexTurn'

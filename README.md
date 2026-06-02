@@ -8,7 +8,7 @@
 </div>
 <br/>
 
-**PSUnplugged is a PowerShell orchestration shell for OpenAI’s Codex App Server. It gives PowerShell users a terminal-native way to drive the Codex runtime while inheriting native support for conversation history, approvals, streamed agent events, AGENTS.md, MCP servers, skills, and plugins. Instead of rebuilding an agent stack from scratch, PSUnplugged makes PowerShell the control surface for reasoning, execution, and automation.**
+**PSUnplugged is a PowerShell orchestration shell for OpenAI's Codex App Server. It gives PowerShell users a terminal-native way to drive governed agent work while inheriting native support for conversation history, approvals, streamed agent events, AGENTS.md, MCP servers, skills, and plugins. Instead of rebuilding an agent stack from scratch, PSUnplugged gives agent workflows a legible PowerShell surface for reasoning, execution, and automation.**
 
 
 <!--
@@ -37,6 +37,8 @@ AI Agent Forge is a community for PowerShell developers stepping into the agenti
 
 The IDE with a side-panel chat window is a fossil. The future is agentic workflows running wherever your code runs — including the terminal you already have open.
 
+PowerShell already taught operators how to govern asynchronous work with `Start-Job`, `Get-Job`, and `Receive-Job`. PSUnplugged applies that same instinct to agent workflows: start the work, inspect the work, read the latest useful output, and resume when needed.
+
 PSUnplugged talks directly to the Codex App Server over JSON-RPC via stdio. It gives you a first-class agentic experience from pure PowerShell, on any machine, in any pipeline.
 
 And because the Codex App Server is provider-agnostic, so is PSUnplugged. Point it at OpenAI, Azure, Ollama, Mistral — swap a line in config.toml and you're done.
@@ -55,6 +57,7 @@ Threads/
 Examples/
   Start-AgentChat.ps1    # interactive REPL — multi-turn chat, streaming, slash commands
   QuickStart.ps1         # working examples for every feature
+  Start-StageReadyDemos.ps1 # launcher for stage-ready task, transcript, and artifact demos
 ```
 
 | File | What it does |
@@ -65,6 +68,7 @@ Examples/
 | `Threads/README.md` | Usage guide for project-aware thread management |
 | `Examples/Start-AgentChat.ps1` | Interactive REPL — multi-turn chat, streaming, slash commands |
 | `Examples/QuickStart.ps1` | Working examples for every feature |
+| `Examples/Start-StageReadyDemos.ps1` | Launcher for stage-ready task, transcript, fan-out, and artifact demos |
 | `ShowMarkdown.psm1` | Terminal Markdown renderer — headers, code blocks, tables with box-drawing chars |
 
 ---
@@ -80,11 +84,11 @@ Examples/
    npm i -g @openai/codex
    ```
 4. **Authenticate** — choose one:
-   - **ChatGPT account** (free tier, supports `gpt-5.1-codex` only):
+   - **ChatGPT account** with access to the Codex runtime model used by this module:
      ```powershell
      codex login
      ```
-   - **OpenAI API key** (required for `gpt-4.1`, `gpt-4o`, etc.) — pass it directly at runtime, no login needed:
+   - **OpenAI API key** — pass it directly at runtime, no login needed:
      ```powershell
      .\Examples\Start-AgentChat.ps1 -ApiKey $env:OPENAI_API_KEY
      ```
@@ -105,8 +109,8 @@ Examples/
 # ChatGPT account (default model)
 .\Examples\Start-AgentChat.ps1
 
-# OpenAI API key — use any model
-.\Examples\Start-AgentChat.ps1 -Model gpt-4.1 -ApiKey $env:OPENAI_API_KEY
+# OpenAI API key
+.\Examples\Start-AgentChat.ps1 -Model gpt-5.2 -ApiKey $env:OPENAI_API_KEY
 ```
 
 **One-liner from a script**
@@ -130,6 +134,91 @@ $r1 = Invoke-CodexTurn -Session $session -ThreadId $thread.id -Text "List the fi
 $r2 = Invoke-CodexTurn -Session $session -ThreadId $thread.id -Text "Now explain what each one does"
 
 Stop-CodexSession -Session $session
+```
+
+**Task-first workflow**
+
+```powershell
+$pending = Start-CodexTask -Cwd (Get-Location).Path -Name repo-tour -Prompt "List the files here and explain what each one does"
+$pending | Get-CodexTask
+$task = $pending | Wait-CodexTask
+
+Get-CodexTask -ActiveOnly
+Receive-CodexTask -Id $task.TaskId
+Receive-CodexTask -Id $task.TaskId -Text
+Resume-CodexTask -Id $task.TaskId -Prompt "Now turn that into a checklist"
+```
+
+**Pipeline-style task workflow**
+
+```powershell
+Start-CodexTask -Cwd . -Prompt "Summarize this repo" |
+  Wait-CodexTask |
+  Receive-CodexTask -Text
+```
+
+You can also pipe multiple prompt strings into `Start-CodexTask` while supplying a shared working directory:
+
+```powershell
+$tasks = @(
+  "Review error handling"
+  "Add README examples"
+  "Write Pester tests"
+) | Start-CodexTask -Cwd .
+
+$tasks | Get-CodexTask
+$tasks | Receive-CodexTask
+$tasks | Get-CodexEvent -Kind Command,ToolCall,Reasoning
+$tasks | Get-CodexApproval
+$tasks | Get-CodexArtifact
+$tasks | ConvertTo-CodexTaskDashboardData | ConvertTo-Json -Depth 20
+$tasks | Show-CodexTaskDashboard
+$tasks | ConvertTo-CodexTaskDashboardData | Show-CodexTaskDashboard
+```
+
+**Live tail for long-running work**
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Read the last 2 issues and summarize" |
+  Wait-CodexTask -Tail -TimeoutSec 900 |
+  Receive-CodexTask -Text
+```
+
+**Live operator telemetry**
+
+```powershell
+Start-CodexTask -Cwd .\scratch\new-work -CreateCwd -Prompt "Inspect this workspace and explain what you're doing" |
+  Wait-CodexTask -Tail -ShowAll -TimeoutSec 900 |
+  Receive-CodexTask -Text
+```
+
+```powershell
+Receive-CodexTask -Id $task.TaskId -Details
+```
+
+**Stage-ready demos**
+
+```powershell
+# See the demo menu and copy-ready commands
+.\Examples\Start-StageReadyDemos.ps1
+
+# Turn the repo into an executive-ready technical brief
+.\Examples\Start-BoardroomBriefDemo.ps1 -Cwd .
+
+# Launch parallel specialist agents and collect the results
+.\Examples\Start-AgentSwarmDemo.ps1 -Cwd .
+
+# Prove agent work is recoverable through threads and transcripts
+.\Examples\Show-AgentFlightRecorderDemo.ps1 -Project .
+
+# Create a scratch workspace and produce demo artifacts
+.\Examples\Start-ArtifactSprintDemo.ps1
+```
+
+**Create a working folder on demand**
+
+```powershell
+Start-CodexTask -Cwd .\scratch\repo-notes -CreateCwd -Prompt "Create a working plan for this new folder"
 ```
 
 **Slash commands inside the chat REPL**
@@ -156,6 +245,52 @@ These values are also exposed by `New-CodexThread` in `PSUnplugged.psm1` as:
 
 - `-ApprovalPolicy`
 - `-SandboxType`
+
+## PowerShell Mental Model
+
+PSUnplugged works best when you think about agent work the way PowerShell already treats jobs.
+
+- `Start-CodexSession` is the connected runtime context for the current shell.
+- `Start-CodexTask` is the task-first operator surface when you want job-style language.
+- `Start-CodexTask` defaults to `gpt-5.2`, matching the minimum supported Codex runtime model.
+- `New-CodexThread` starts a unit of agent work in that runtime.
+- `Get-CodexTask` is the task-first inspection view and lists active/attention tasks plus recently completed tasks across projects, like an operator board.
+- `Get-CodexTask -Project .` scopes the view to the current project, `-ActiveOnly` narrows the view to tasks that are still in play, and `-All` includes older completed task history.
+- `Get-CodexTask -RecentHours 12` or `Get-CodexTask -Since (Get-Date).Date` tunes the completed-task window; the default window is 4 hours.
+- `Get-CodexTask -LocalOnly` skips the Codex app-server refresh when you want the fastest local catalog view.
+- `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
+- `Get-CodexTask` surfaces task errors in the default table when a worker stops before Codex reports completion.
+- `Start-CodexTask -TurnTimeoutSec <n>` controls the task worker's Codex turn wait; the default is 900 seconds.
+- `Get-CodexThread` and `Get-CodexThreads` let you inspect what is running or available.
+- `Wait-CodexTask` blocks until a task reaches a terminal state like a final answer.
+- `Wait-CodexTask -Tail` streams new transcript items to the console while it waits.
+- `Wait-CodexTask -Tail -ShowAll` surfaces live operator telemetry from the task rollout.
+- `Receive-CodexTask -Details` returns the full transcript plus reasoning, tools, and commands after the task finishes.
+- `Wait-CodexTask -TimeoutSec <n>` gives you a clean escape hatch for long-running work.
+- `Receive-CodexTask` gives you a compact latest-output summary by default.
+- `Receive-CodexTask -Text` returns the full latest assistant text.
+- `Receive-CodexTask -Transcript` returns the full transcript. Add `-ShowAll` for reasoning, tools, and commands, or use `-Details` as the short form for `-Transcript -ShowAll`. In the default summary view, telemetry switches are ignored so the summary stays focused on the latest assistant output or task state.
+- `Get-CodexTranscript` returns the conversation-shaped history for a thread.
+- `Get-CodexEvent` returns the operational event stream for a task: commands, tools, reasoning, approvals, messages, and lifecycle events.
+- `Get-CodexApproval` returns observed approval requests as read-only objects.
+- `Get-CodexArtifact` returns durable task artifacts and materialized views: session JSONL, latest result text, transcript, and event log.
+- `ConvertTo-CodexTaskDashboardData` returns the stable JSON-ready data contract for a custom dashboard frontend.
+- `Show-CodexTaskDashboard` builds a local browser dashboard over tasks, latest output, events, artifacts, approvals, and an NLP-style command bar for filtering.
+- `Resume-CodexTask` lets you continue the same unit of work with another prompt.
+- `Start-CodexTask -CreateCwd` can create a missing working folder before the task starts.
+- `Enter-CodexThread` and `Resume-CodexThread` let you pick work back up.
+
+That means the module is not positioning threads as disposable chat tabs. It is treating them as managed work with lifecycle, state, and recoverable history.
+
+In short:
+
+```powershell
+Start-CodexTask "Inspect this repo and propose next steps"
+Get-CodexTask
+Wait-CodexTask
+Receive-CodexTask
+Resume-CodexTask -Id <task-id> -Prompt "Turn that into an action plan"
+```
 
 ---
 
@@ -227,7 +362,7 @@ The Codex App Server isn't just a model endpoint — it's a full agentic runtime
   - Skills and AGENTS.md stack: global instructions + repo-level instructions + skills are all merged into the agent's context at session start
 - **Provider-agnostic** — swap models without changing client code
 
-PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the cloud version of the app-server, the same code points at a URL instead of a local process.
+PSUnplugged is the PowerShell binding to that runtime. MCP gives the agent tools; PSUnplugged gives the operator a PowerShell-native way to govern the work. When OpenAI ships the cloud version of the app-server, the same code points at a URL instead of a local process.
 
 ---
 
@@ -245,7 +380,7 @@ PSUnplugged is the PowerShell binding to that runtime. When OpenAI ships the clo
 
 ## Known Limitations
 - Currently read-only (no file writes or command execution — approval flow coming soon via [AI Agent Forge](https://forms.gle/gvw8cU2pgFeXWMNZA))
-- Tested primarily with OpenAI-hosted Codex models (gpt-5.1-codex via ChatGPT login, or API key for others)
+- Tested primarily with Codex models such as `gpt-5.2` or newer
 - Multi-provider support (Ollama, xAI, etc.) is experimental and requires manual config.toml tweaks — not documented here yet
 
 ## Built With

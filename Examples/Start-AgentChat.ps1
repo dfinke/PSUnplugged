@@ -15,7 +15,7 @@
     Usage:
       .\Examples\Start-AgentChat.ps1
         .\Examples\Start-AgentChat.ps1 -Verbose
-      .\Examples\Start-AgentChat.ps1 -Model "gpt-5.1-codex" -Cwd "D:\myproject"
+    .\Examples\Start-AgentChat.ps1 -Model "gpt-5.2" -Cwd "D:\myproject"
       .\Examples\Start-AgentChat.ps1 -Model "gpt-4.1" -ApiKey $env:OPENAI_API_KEY
       .\Examples\Start-AgentChat.ps1 -ThreadId "<existing-thread-id>"
 
@@ -29,7 +29,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Model = "gpt-5.1-codex",
+    [string]$Model = "gpt-5.2",
     [string]$Cwd = (Get-Location).Path,
     [string]$CodexExe = $env:CODEX_EXE,
     [string]$ApiKey,
