@@ -28,6 +28,117 @@ AfterAll {
 }
 
 Describe 'PSUnplugged task lifecycle regressions' {
+    Context 'Codex message router' {
+        It 'routes JSON-RPC responses to their matching waiter' {
+            InModuleScope -ModuleName $script:ModuleUnderTestName {
+                $session = [pscustomobject]@{
+                    Router = New-CodexMessageRouter
+                }
+                $waiter = [System.Collections.Concurrent.BlockingCollection[object]]::new(1)
+                $session.Router.ResponseWaiters['request-1'] = $waiter
+
+                Route-CodexTransportMessage -Session $session -Message ([pscustomobject]@{
+                        id     = 'request-1'
+                        result = [pscustomobject]@{ ok = $true }
+                    })
+
+                $item = $null
+                $waiter.TryTake([ref]$item, 100) | Should -BeTrue
+                $item.result.ok | Should -BeTrue
+                $session.Router.ResponseWaiters.ContainsKey('request-1') | Should -BeFalse
+            }
+        }
+
+        It 'replays pending turn notifications when the turn queue is registered' {
+            InModuleScope -ModuleName $script:ModuleUnderTestName {
+                $session = [pscustomobject]@{
+                    Router = New-CodexMessageRouter
+                }
+                $notification = [pscustomobject]@{
+                    method = 'item/completed'
+                    params = [pscustomobject]@{
+                        turnId = 'turn-1'
+                        item   = [pscustomobject]@{ type = 'agentMessage'; text = 'Done.' }
+                    }
+                }
+
+                Add-CodexRouterNotification -Session $session -Message $notification
+                $session.Router.PendingTurnNotifications.ContainsKey('turn-1') | Should -BeTrue
+
+                Register-CodexTurnQueue -Session $session -TurnId 'turn-1'
+                $session.Router.PendingTurnNotifications.ContainsKey('turn-1') | Should -BeFalse
+
+                $item = $null
+                $session.Router.TurnQueues['turn-1'].TryTake([ref]$item, 100) | Should -BeTrue
+                $item.params.item.text | Should -Be 'Done.'
+            }
+        }
+
+        It 'routes live turn notifications to a pre-registered turn queue' {
+            InModuleScope -ModuleName $script:ModuleUnderTestName {
+                $session = [pscustomobject]@{
+                    Router = New-CodexMessageRouter
+                }
+
+                Register-CodexTurnQueue -Session $session -TurnId 'turn-1'
+                Add-CodexRouterNotification -Session $session -Message ([pscustomobject]@{
+                        method = 'turn/completed'
+                        params = [pscustomobject]@{ turnId = 'turn-1' }
+                    })
+
+                $item = $null
+                $session.Router.TurnQueues['turn-1'].TryTake([ref]$item, 100) | Should -BeTrue
+                $item.method | Should -Be 'turn/completed'
+            }
+        }
+
+        It 'routes unscoped notifications to the global queue' {
+            InModuleScope -ModuleName $script:ModuleUnderTestName {
+                $session = [pscustomobject]@{
+                    Router = New-CodexMessageRouter
+                }
+
+                Add-CodexRouterNotification -Session $session -Message ([pscustomobject]@{
+                        method = 'thread/started'
+                        params = [pscustomobject]@{ threadId = 'thread-1' }
+                    })
+
+                $item = $null
+                $session.Router.GlobalNotifications.TryTake([ref]$item, 100) | Should -BeTrue
+                $item.method | Should -Be 'thread/started'
+            }
+        }
+    }
+
+    Context 'Model resolution' {
+        It 'uses the upgrade target for the default runtime model when no model is requested' {
+            InModuleScope -ModuleName $script:ModuleUnderTestName {
+                $script:CodexModelLookupCache = $null
+                Mock Get-CodexModels {
+                    [pscustomobject]@{
+                        data = @(
+                            [pscustomobject]@{
+                                id        = 'gpt-5.3-codex'
+                                model     = 'gpt-5.3-codex'
+                                upgrade   = 'gpt-5.4'
+                                isDefault = $true
+                            },
+                            [pscustomobject]@{
+                                id        = 'gpt-5.4'
+                                model     = 'gpt-5.4'
+                                upgrade   = $null
+                                isDefault = $false
+                            }
+                        )
+                    }
+                }
+
+                Resolve-CodexRequestedModel -Session ([pscustomobject]@{}) -Model $null |
+                    Should -Be 'gpt-5.4'
+            }
+        }
+    }
+
     Context 'Task listing scope' {
         It 'lists recent tasks across projects by default' {
             InModuleScope -ModuleName $script:ModuleUnderTestName {
@@ -461,6 +572,28 @@ Describe 'PSUnplugged task lifecycle regressions' {
     }
 
     Context 'Project location resolution' {
+        It 'resolves client cwd paths from the PowerShell location' {
+            $testRoot = (Get-Item -LiteralPath TestDrive:\).FullName
+            $expectedPath = Join-Path $testRoot 'periodicTable'
+            $originalCurrentDirectory = [Environment]::CurrentDirectory
+
+            Push-Location -LiteralPath $testRoot
+            try {
+                [Environment]::CurrentDirectory = [Environment]::SystemDirectory
+
+                InModuleScope -ModuleName $script:ModuleUnderTestName -Parameters @{ ExpectedPath = $expectedPath } {
+                    param([string]$ExpectedPath)
+
+                    Resolve-CodexClientPath -Path '.\periodicTable' |
+                        Should -Be $ExpectedPath
+                }
+            }
+            finally {
+                [Environment]::CurrentDirectory = $originalCurrentDirectory
+                Pop-Location
+            }
+        }
+
         It 'resolves missing relative paths from the PowerShell location' {
             $testRoot = (Get-Item -LiteralPath TestDrive:\).FullName
             $expectedPath = Join-Path $testRoot 'periodicTable'

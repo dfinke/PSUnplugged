@@ -8,7 +8,311 @@ if (Test-Path -LiteralPath $threadFormatPath) {
     Update-FormatData -PrependPath $threadFormatPath -ErrorAction SilentlyContinue
 }
 
-if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImported -ErrorAction Ignore)) {
+if ($true) {
+    function New-CodexMessageRouter {
+        [CmdletBinding()]
+        param()
+
+        return [PSCustomObject]@{
+            Sync                      = [object]::new()
+            ResponseWaiters           = [hashtable]::Synchronized(@{})
+            TurnQueues                = [hashtable]::Synchronized(@{})
+            PendingTurnNotifications  = [hashtable]::Synchronized(@{})
+            LoginQueues               = [hashtable]::Synchronized(@{})
+            PendingLoginNotifications = [hashtable]::Synchronized(@{})
+            GlobalNotifications       = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+            TransportError            = $null
+        }
+    }
+
+    function Get-CodexMessageTurnId {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)]$Message)
+
+        $params = $Message.params
+        if (-not $params) { return $null }
+
+        foreach ($propertyName in 'turnId', 'turn_id') {
+            $property = $params.PSObject.Properties[$propertyName]
+            if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                return [string]$property.Value
+            }
+        }
+
+        $turnProperty = $params.PSObject.Properties['turn']
+        if ($turnProperty -and $turnProperty.Value) {
+            foreach ($propertyName in 'id', 'Id') {
+                $property = $turnProperty.Value.PSObject.Properties[$propertyName]
+                if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    return [string]$property.Value
+                }
+            }
+        }
+
+        return $null
+    }
+
+    function Get-CodexMessageLoginId {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)]$Message)
+
+        if ($Message.method -ne 'account/login/completed') { return $null }
+        $params = $Message.params
+        if (-not $params) { return $null }
+
+        foreach ($propertyName in 'loginId', 'login_id') {
+            $property = $params.PSObject.Properties[$propertyName]
+            if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                return [string]$property.Value
+            }
+        }
+
+        return $null
+    }
+
+    function Write-CodexRouterQueue {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]$Queue,
+            [Parameter(Mandatory)]$Item
+        )
+
+        if ($Queue -is [System.Collections.Concurrent.BlockingCollection[object]]) {
+            $Queue.Add($Item)
+            return
+        }
+
+        throw "Unsupported Codex router queue type: $($Queue.GetType().FullName)"
+    }
+
+    function Register-CodexTurnQueue {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][PSCustomObject]$Session,
+            [Parameter(Mandatory)][string]$TurnId
+        )
+
+        if (-not $Session.Router) { return }
+        $router = $Session.Router
+        [System.Threading.Monitor]::Enter($router.Sync)
+        try {
+            if (-not $router.TurnQueues.ContainsKey($TurnId)) {
+                $router.TurnQueues[$TurnId] = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+            }
+
+            $queue = $router.TurnQueues[$TurnId]
+            if ($router.PendingTurnNotifications.ContainsKey($TurnId)) {
+                $pending = @($router.PendingTurnNotifications[$TurnId])
+                $router.PendingTurnNotifications.Remove($TurnId)
+                foreach ($notification in $pending) {
+                    Write-CodexRouterQueue -Queue $queue -Item $notification
+                }
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($router.Sync)
+        }
+    }
+
+    function Unregister-CodexTurnQueue {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][PSCustomObject]$Session,
+            [Parameter(Mandatory)][string]$TurnId
+        )
+
+        if (-not $Session.Router) { return }
+        $router = $Session.Router
+        [System.Threading.Monitor]::Enter($router.Sync)
+        try {
+            if ($router.TurnQueues.ContainsKey($TurnId)) {
+                $router.TurnQueues[$TurnId].CompleteAdding()
+                $router.TurnQueues.Remove($TurnId)
+            }
+            if ($router.PendingTurnNotifications.ContainsKey($TurnId)) {
+                $router.PendingTurnNotifications.Remove($TurnId)
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($router.Sync)
+        }
+    }
+
+    function Add-CodexRouterNotification {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][PSCustomObject]$Session,
+            [Parameter(Mandatory)]$Message
+        )
+
+        $router = $Session.Router
+        if (-not $router) { return }
+
+        $loginId = Get-CodexMessageLoginId -Message $Message
+        if ($loginId) {
+            [System.Threading.Monitor]::Enter($router.Sync)
+            try {
+                if ($router.LoginQueues.ContainsKey($loginId)) {
+                    Write-CodexRouterQueue -Queue $router.LoginQueues[$loginId] -Item $Message
+                    return
+                }
+
+                if (-not $router.PendingLoginNotifications.ContainsKey($loginId)) {
+                    $router.PendingLoginNotifications[$loginId] = [System.Collections.Generic.List[object]]::new()
+                }
+                $router.PendingLoginNotifications[$loginId].Add($Message)
+                return
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($router.Sync)
+            }
+        }
+
+        $turnId = Get-CodexMessageTurnId -Message $Message
+        if ($turnId) {
+            [System.Threading.Monitor]::Enter($router.Sync)
+            try {
+                if ($router.TurnQueues.ContainsKey($turnId)) {
+                    Write-CodexRouterQueue -Queue $router.TurnQueues[$turnId] -Item $Message
+                    return
+                }
+
+                if (-not $router.PendingTurnNotifications.ContainsKey($turnId)) {
+                    $router.PendingTurnNotifications[$turnId] = [System.Collections.Generic.List[object]]::new()
+                }
+                $router.PendingTurnNotifications[$turnId].Add($Message)
+                return
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($router.Sync)
+            }
+        }
+
+        Write-CodexRouterQueue -Queue $router.GlobalNotifications -Item $Message
+    }
+
+    function Read-CodexTransportMessage {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][PSCustomObject]$Session,
+            [int]$TimeoutMs
+        )
+
+        if (-not $Session.PendingReadTask) {
+            $Session.PendingReadTask = $Session.Reader.ReadLineAsync()
+        }
+
+        $completed = if ($PSBoundParameters.ContainsKey('TimeoutMs')) {
+            $Session.PendingReadTask.Wait($TimeoutMs)
+        }
+        else {
+            $Session.PendingReadTask.Wait()
+            $true
+        }
+
+        if (-not $completed) {
+            return [PSCustomObject]@{ HasMessage = $false; Message = $null }
+        }
+
+        $line = $Session.PendingReadTask.Result
+        $Session.PendingReadTask = $null
+        if ($null -eq $line) { throw "codex app-server closed unexpectedly" }
+        return [PSCustomObject]@{ HasMessage = $true; Message = ($line | ConvertFrom-Json) }
+    }
+
+    function Route-CodexTransportMessage {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][PSCustomObject]$Session,
+            [Parameter(Mandatory)]$Message
+        )
+
+        $router = $Session.Router
+        if (-not $router) { return }
+
+        if ($null -ne $Message.id -and -not $Message.method) {
+            $requestId = [string]$Message.id
+            $waiter = $null
+            [System.Threading.Monitor]::Enter($router.Sync)
+            try {
+                if ($router.ResponseWaiters.ContainsKey($requestId)) {
+                    $waiter = $router.ResponseWaiters[$requestId]
+                    $router.ResponseWaiters.Remove($requestId)
+                }
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($router.Sync)
+            }
+
+            if ($waiter) {
+                Write-CodexRouterQueue -Queue $waiter -Item $Message
+            }
+            return
+        }
+
+        if ($Message.method -and $null -ne $Message.id) {
+            $response = @{
+                id     = $Message.id
+                result = @{ decision = 'accept' }
+            }
+            $json = $response | ConvertTo-Json -Depth 20 -Compress
+            $Session.Writer.WriteLine($json)
+            $Session.Writer.Flush()
+            return
+        }
+
+        if ($Message.method) {
+            Add-CodexRouterNotification -Session $Session -Message $Message
+        }
+    }
+
+    function Receive-CodexQueueItem {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]$Queue,
+            [int]$TimeoutMs
+        )
+
+        $item = $null
+        if ($PSBoundParameters.ContainsKey('TimeoutMs')) {
+            if (-not $Queue.TryTake([ref]$item, $TimeoutMs)) {
+                return [PSCustomObject]@{ HasItem = $false; Item = $null }
+            }
+        }
+        else {
+            $item = $Queue.Take()
+        }
+
+        if ($item -is [System.Management.Automation.ErrorRecord]) {
+            throw $item
+        }
+
+        return [PSCustomObject]@{ HasItem = $true; Item = $item }
+    }
+
+    function Resolve-CodexClientPath {
+        [CmdletBinding()]
+        param(
+            [string]$Path
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return $null
+        }
+
+        try {
+            return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        }
+        catch {
+            try {
+                return [System.IO.Path]::GetFullPath($Path)
+            }
+            catch {
+                return $Path
+            }
+        }
+    }
+
     function Start-CodexSession {
         [CmdletBinding()]
         param(
@@ -71,17 +375,22 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
         }
 
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $startDirectory = Resolve-CodexClientPath -Path (Get-Location).Path
+        if (-not [string]::IsNullOrWhiteSpace($startDirectory) -and (Test-Path -LiteralPath $startDirectory -PathType Container)) {
+            $psi.WorkingDirectory = $startDirectory
+        }
+
         if ($resolvedPath -match '\.ps1$') {
             $psi.FileName = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh.exe" } else { "powershell.exe" }
-            $psi.Arguments = "-NoProfile -NonInteractive -File `"$resolvedPath`" app-server"
+            $psi.Arguments = "-NoProfile -NonInteractive -File `"$resolvedPath`" app-server --listen stdio://"
         }
         elseif ($resolvedPath -match '\.(cmd|bat)$') {
             $psi.FileName = "cmd.exe"
-            $psi.Arguments = "/c `"$resolvedPath`" app-server"
+            $psi.Arguments = "/c `"$resolvedPath`" app-server --listen stdio://"
         }
         else {
             $psi.FileName = $resolvedPath
-            $psi.Arguments = "app-server"
+            $psi.Arguments = "app-server --listen stdio://"
         }
         $psi.UseShellExecute = $false
         $psi.RedirectStandardInput = $true
@@ -96,6 +405,7 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
             Process         = $proc
             Writer          = $proc.StandardInput
             Reader          = $proc.StandardOutput
+            Router          = New-CodexMessageRouter
             PendingReadTask = $null
             NextId          = 1
             Verbose         = $VerbosePreference -ne 'SilentlyContinue'
@@ -106,6 +416,9 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
                 name    = $ClientName
                 title   = $ClientTitle
                 version = $Version
+            }
+            capabilities = @{
+                experimentalApi = $true
             }
         }
 
@@ -146,6 +459,31 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
             [int]$TimeoutMs
         )
 
+        if ($Session.Router) {
+            $read = Receive-CodexQueueItem -Queue $Session.Router.GlobalNotifications -TimeoutMs $TimeoutMs
+            if (-not $read.HasItem) {
+                $readMessage = if ($PSBoundParameters.ContainsKey('TimeoutMs')) {
+                    Read-CodexTransportMessage -Session $Session -TimeoutMs $TimeoutMs
+                }
+                else {
+                    Read-CodexTransportMessage -Session $Session
+                }
+
+                if (-not $readMessage.HasMessage) {
+                    return [PSCustomObject]@{ HasLine = $false; Line = $null }
+                }
+
+                Route-CodexTransportMessage -Session $Session -Message $readMessage.Message
+                $read = Receive-CodexQueueItem -Queue $Session.Router.GlobalNotifications -TimeoutMs 0
+                if (-not $read.HasItem) {
+                    return [PSCustomObject]@{ HasLine = $false; Line = $null }
+                }
+            }
+
+            $line = $read.Item | ConvertTo-Json -Depth 20 -Compress
+            return [PSCustomObject]@{ HasLine = $true; Line = $line }
+        }
+
         if (-not $Session.PendingReadTask) {
             $Session.PendingReadTask = $Session.Reader.ReadLineAsync()
         }
@@ -178,6 +516,45 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
         $id = $Session.NextId++
         $msg = @{ method = $Method; id = $id; params = $Params }
         $json = $msg | ConvertTo-Json -Depth 20 -Compress
+
+        if ($Session.Router) {
+            $requestId = [string]$id
+            $waiter = [System.Collections.Concurrent.BlockingCollection[object]]::new(1)
+            [System.Threading.Monitor]::Enter($Session.Router.Sync)
+            try {
+                $Session.Router.ResponseWaiters[$requestId] = $waiter
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($Session.Router.Sync)
+            }
+
+            try {
+                $Session.Writer.WriteLine($json)
+                $Session.Writer.Flush()
+            }
+            catch {
+                [System.Threading.Monitor]::Enter($Session.Router.Sync)
+                try {
+                    $Session.Router.ResponseWaiters.Remove($requestId)
+                }
+                finally {
+                    [System.Threading.Monitor]::Exit($Session.Router.Sync)
+                }
+                throw
+            }
+
+            while ($waiter.Count -eq 0) {
+                $readMessage = Read-CodexTransportMessage -Session $Session
+                Route-CodexTransportMessage -Session $Session -Message $readMessage.Message
+            }
+
+            $response = (Receive-CodexQueueItem -Queue $waiter).Item
+            if ($response.error) {
+                throw "Codex error ($($response.error.code)): $($response.error.message)"
+            }
+            return $response.result
+        }
+
         $Session.Writer.WriteLine($json)
         $Session.Writer.Flush()
 
@@ -215,24 +592,79 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
         param(
             [Parameter(Mandatory)][PSCustomObject]$Session,
             [int]$TimeoutMs = 60000,
-            [switch]$WaitForTurnComplete
+            [switch]$WaitForTurnComplete,
+            [string]$TurnId
         )
 
         $events = [System.Collections.Generic.List[PSObject]]::new()
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $completionDrain = $null
+        $registeredTurnId = $null
+        $turnQueue = $null
+        $pendingTurnIds = @()
+
+        if ($Session.Router) {
+            if (-not [string]::IsNullOrWhiteSpace($TurnId)) {
+                $registeredTurnId = [string]$TurnId
+            }
+            else {
+                [System.Threading.Monitor]::Enter($Session.Router.Sync)
+                try {
+                    $pendingTurnIds = @($Session.Router.PendingTurnNotifications.Keys)
+                }
+                finally {
+                    [System.Threading.Monitor]::Exit($Session.Router.Sync)
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($registeredTurnId) -and $pendingTurnIds.Count -gt 0) {
+                $registeredTurnId = [string]@($pendingTurnIds)[0]
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($registeredTurnId)) {
+                Register-CodexTurnQueue -Session $Session -TurnId $registeredTurnId
+                $turnQueue = $Session.Router.TurnQueues[$registeredTurnId]
+            }
+        }
 
         while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+            if ($completionDrain -and $completionDrain.ElapsedMilliseconds -ge 1000) {
+                break
+            }
+
             $remaining = $TimeoutMs - [int]$sw.ElapsedMilliseconds
             if ($remaining -le 0) { break }
 
-            $slice = [Math]::Min(500, $remaining)
-            $read = Receive-CodexLine -Session $Session -TimeoutMs $slice
-            if (-not $read.HasLine) { continue }
+            $slice = if ($completionDrain) { [Math]::Min(100, $remaining) } else { [Math]::Min(500, $remaining) }
+            if (($null -ne $Session.Router) -and ($null -ne $turnQueue)) {
+                $read = Receive-CodexQueueItem -Queue $turnQueue -TimeoutMs 0
+                if (-not $read.HasItem) {
+                    try {
+                        $readMessage = Read-CodexTransportMessage -Session $Session -TimeoutMs $slice
+                        if (-not $readMessage.HasMessage) {
+                            continue
+                        }
+                        Route-CodexTransportMessage -Session $Session -Message $readMessage.Message
+                    }
+                    catch {
+                        throw
+                    }
+                    $read = Receive-CodexQueueItem -Queue $turnQueue -TimeoutMs $slice
+                    if (-not $read.HasItem) {
+                        continue
+                    }
+                }
+                $parsed = $read.Item
+            }
+            else {
+                $read = Receive-CodexLine -Session $Session -TimeoutMs $slice
+                if (-not $read.HasLine) { continue }
 
-            $line = $read.Line
-            if ($null -eq $line) { break }
+                $line = $read.Line
+                if ($null -eq $line) { break }
 
-            $parsed = $line | ConvertFrom-Json
+                $parsed = $line | ConvertFrom-Json
+            }
             $events.Add($parsed)
 
             if ($parsed.method -eq "item/commandExecution/requestApproval" -or
@@ -247,8 +679,14 @@ if (-not (Get-Command -Name Start-CodexSession -CommandType Function -ListImport
             }
 
             if ($WaitForTurnComplete -and $parsed.method -eq "turn/completed") {
-                break
+                if (-not $completionDrain) {
+                    $completionDrain = [System.Diagnostics.Stopwatch]::StartNew()
+                }
             }
+        }
+
+        if ($Session.Router -and $registeredTurnId) {
+            Unregister-CodexTurnQueue -Session $Session -TurnId $registeredTurnId
         }
 
         return $events
@@ -3058,7 +3496,7 @@ function New-PSUnpluggedManagedThread {
     [CmdletBinding()]
     param(
         [PSCustomObject]$Session,
-        [string]$Model = 'gpt-5.2',
+        [string]$Model,
         [Alias('Path')][string]$Cwd,
         [string]$ApprovalPolicy = 'never',
         [ValidateSet('read-only', 'workspace-write', 'danger-full-access')]
@@ -6657,7 +7095,7 @@ function Enter-CodexThread {
         [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('ThreadId')][string]$Id,
         [Alias('Path', 'Project')][string]$ProjectPath,
         [string]$Prompt,
-        [string]$Model = 'gpt-5.2',
+        [string]$Model,
         [PSCustomObject]$Session
     )
 
@@ -7209,7 +7647,12 @@ function Get-CodexModelLookup {
             $modelItems = @($modelItems[0])
         }
 
+        $defaultModel = $null
         foreach ($modelItem in $modelItems) {
+            if (-not $defaultModel -and [bool](Get-CodexFirstValue -InputObject $modelItem -PropertyName @('isDefault', 'IsDefault'))) {
+                $defaultModel = [string](Get-CodexFirstValue -InputObject $modelItem -PropertyName @('upgrade', 'Upgrade', 'id', 'Id', 'model', 'Model'))
+            }
+
             foreach ($value in @(
                     [string](Get-CodexFirstValue -InputObject $modelItem -PropertyName @('id', 'Id')),
                     [string](Get-CodexFirstValue -InputObject $modelItem -PropertyName @('model', 'Model'))
@@ -7221,8 +7664,9 @@ function Get-CodexModelLookup {
         }
 
         $script:CodexModelLookupCache = [PSCustomObject]@{
-            RetrievedAt = Get-Date
-            Models      = $lookup
+            RetrievedAt   = Get-Date
+            Models        = $lookup
+            DefaultModel  = $defaultModel
         }
         return $lookup
     }
@@ -7244,6 +7688,11 @@ function Resolve-CodexRequestedModel {
     )
 
     if ([string]::IsNullOrWhiteSpace($Model)) {
+        $null = Get-CodexModelLookup -Session $Session
+        if ($script:CodexModelLookupCache -and -not [string]::IsNullOrWhiteSpace($script:CodexModelLookupCache.DefaultModel)) {
+            return [string]$script:CodexModelLookupCache.DefaultModel
+        }
+
         return $Model
     }
 
@@ -8011,7 +8460,7 @@ function Write-PSUnpluggedTaskReadyFile {
 function Start-PSUnpluggedTaskWorkerProcess {
     [CmdletBinding()]
     param(
-        [string]$Model = 'gpt-5.2',
+        [string]$Model,
         [string]$Cwd,
         [string]$ApprovalPolicy = 'never',
         [string]$SandboxType = 'workspace-write',
@@ -8266,7 +8715,7 @@ function Start-CodexTask {
     [CmdletBinding()]
     param(
         [PSCustomObject]$Session,
-        [string]$Model = 'gpt-5.2',
+        [string]$Model,
         [Parameter(ValueFromPipeline = $true, DontShow = $true)]
         $InputObject,
         [Alias('Path')]
@@ -8929,7 +9378,7 @@ function Resume-CodexTask {
         [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
         [Alias('Path', 'Project')][string]$ProjectPath,
         [string]$Prompt,
-        [string]$Model = 'gpt-5.2',
+        [string]$Model,
         [PSCustomObject]$Session
     )
 
