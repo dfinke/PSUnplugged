@@ -669,6 +669,24 @@ function Import-PSUnpluggedCatalog {
         return (Initialize-PSUnpluggedCatalog)
     }
 
+    if ($catalog -is [System.Collections.IEnumerable] -and -not ($catalog -is [string])) {
+        $normalizedCatalog = Initialize-PSUnpluggedCatalog
+        foreach ($item in @($catalog)) {
+            if ($null -eq $item -or -not $item.PSObject) {
+                continue
+            }
+
+            if ($item.PSObject.Properties['projects']) {
+                $normalizedCatalog.projects += @($item.projects | Where-Object { $null -ne $_ })
+            }
+            if ($item.PSObject.Properties['threads']) {
+                $normalizedCatalog.threads += @($item.threads | Where-Object { $null -ne $_ })
+            }
+        }
+
+        $catalog = $normalizedCatalog
+    }
+
     if (-not $catalog.projects) { $catalog | Add-Member -NotePropertyName projects -NotePropertyValue @() -Force }
     if (-not $catalog.threads) { $catalog | Add-Member -NotePropertyName threads -NotePropertyValue @() -Force }
     if (-not $catalog.version) { $catalog | Add-Member -NotePropertyName version -NotePropertyValue 1 -Force }
@@ -1168,6 +1186,424 @@ function Get-CodexToolCallSummary {
     }
 
     return $displayName
+}
+
+function Get-CodexEventSummary {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Text,
+        [string]$Fallback,
+        [int]$MaxLength = 180
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        return (ConvertTo-CodexTelemetryValueText -Value $Text -MaxLength $MaxLength)
+    }
+
+    return $Fallback
+}
+
+function Get-CodexNestedFirstValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string[]]$PropertyName,
+        [int]$MaxDepth = 4
+    )
+
+    if ($null -eq $InputObject -or $MaxDepth -lt 0) {
+        return $null
+    }
+
+    foreach ($name in $PropertyName) {
+        $property = $InputObject.PSObject.Properties[$name]
+        if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return $property.Value
+        }
+    }
+
+    if ($InputObject -is [string]) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in @($InputObject.Keys)) {
+            foreach ($name in $PropertyName) {
+                if ([string]::Equals([string]$key, [string]$name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $value = $InputObject[$key]
+                    if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+                        return $value
+                    }
+                }
+            }
+        }
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        foreach ($item in @($InputObject)) {
+            $value = Get-CodexNestedFirstValue -InputObject $item -PropertyName $PropertyName -MaxDepth ($MaxDepth - 1)
+            if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                return $value
+            }
+        }
+
+        return $null
+    }
+
+    foreach ($property in @($InputObject.PSObject.Properties)) {
+        $value = $property.Value
+        if ($null -eq $value -or $value -is [string]) {
+            continue
+        }
+
+        $nested = Get-CodexNestedFirstValue -InputObject $value -PropertyName $PropertyName -MaxDepth ($MaxDepth - 1)
+        if ($null -ne $nested -and -not [string]::IsNullOrWhiteSpace([string]$nested)) {
+            return $nested
+        }
+    }
+
+    return $null
+}
+
+function New-CodexEvent {
+    [CmdletBinding()]
+    param(
+        [string]$ThreadId,
+        [string]$ThreadName,
+        [string]$Project,
+        [string]$TurnId,
+        [int]$Index,
+        [string]$Kind,
+        [string]$Type,
+        [string]$Name,
+        [string]$Phase,
+        [string]$Summary,
+        [string]$Text,
+        [string]$Source = 'SessionJsonl',
+        [string]$SessionPath,
+        [AllowNull()][Nullable[DateTimeOffset]]$Timestamp,
+        [AllowNull()]$RawEvent,
+        [switch]$IncludeRaw
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Kind)) {
+        $Kind = 'Unknown'
+    }
+
+    $timestampValue = if ($null -ne $Timestamp) { [DateTimeOffset]$Timestamp } else { $null }
+    $eventId = if (-not [string]::IsNullOrWhiteSpace($ThreadId)) {
+        '{0}:{1}' -f (Get-CodexCompactId -Id $ThreadId -Length 8), $Index
+    }
+    else {
+        'event:{0}' -f $Index
+    }
+
+    $event = [PSCustomObject]@{
+        Id          = $eventId
+        TaskId      = $ThreadId
+        ThreadId    = $ThreadId
+        ThreadName  = $ThreadName
+        Project     = $Project
+        TurnId      = $TurnId
+        Index       = $Index
+        Kind        = $Kind
+        Type        = $Type
+        Name        = $Name
+        Phase       = $Phase
+        Timestamp   = if ($null -ne $timestampValue) { $timestampValue.ToString('o') } else { $null }
+        When        = if ($null -ne $timestampValue) { Get-CodexDisplayTimestamp -Timestamp $timestampValue } else { $null }
+        Summary     = $Summary
+        Text        = $Text
+        Source      = $Source
+        SessionPath = $SessionPath
+    }
+
+    if ($IncludeRaw) {
+        $event | Add-Member -NotePropertyName RawEvent -NotePropertyValue $RawEvent -Force
+        $event.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexEvent.Raw')
+        if (-not ($event.PSObject.TypeNames -contains 'PSUnplugged.CodexEvent')) {
+            $event.PSObject.TypeNames.Insert(1, 'PSUnplugged.CodexEvent')
+        }
+    }
+    elseif (-not ($event.PSObject.TypeNames -contains 'PSUnplugged.CodexEvent')) {
+        $event.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexEvent')
+    }
+    return $event
+}
+
+function ConvertTo-CodexEventsFromThreadRecord {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Thread,
+        [string]$ThreadName,
+        [string]$Project,
+        [switch]$IncludeRaw
+    )
+
+    if ($null -eq $Thread) {
+        return @()
+    }
+
+    $threadId = [string](Get-CodexFirstValue -InputObject $Thread -PropertyName @('id', 'Id', 'threadId', 'ThreadId'))
+    $events = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+
+    foreach ($turn in @($Thread.turns)) {
+        $turnId = [string](Get-CodexFirstValue -InputObject $turn -PropertyName @('id', 'Id', 'turnId', 'TurnId'))
+        foreach ($turnItem in @($turn.items)) {
+            $itemType = [string](Get-CodexFirstValue -InputObject $turnItem -PropertyName @('type', 'Type'))
+            $kind = switch ($itemType) {
+                'userMessage' { 'UserMessage' }
+                'agentMessage' { 'AgentMessage' }
+                default { $null }
+            }
+            if ([string]::IsNullOrWhiteSpace($kind)) {
+                continue
+            }
+
+            $text = Get-CodexTranscriptText -InputObject $turnItem
+            $timestamp = $null
+            foreach ($value in @(
+                    (Get-CodexFirstValue -InputObject $turnItem -PropertyName @('createdAt', 'CreatedAt', 'timestamp', 'Timestamp', 'updatedAt', 'UpdatedAt')),
+                    (Get-CodexFirstValue -InputObject $turn -PropertyName @('createdAt', 'CreatedAt', 'timestamp', 'Timestamp', 'updatedAt', 'UpdatedAt'))
+                )) {
+                $timestamp = ConvertTo-CodexDateTimeOffset -Value $value
+                if ($timestamp) {
+                    break
+                }
+            }
+
+            $index++
+            $events.Add((New-CodexEvent -ThreadId $threadId -ThreadName $ThreadName -Project $Project -TurnId $turnId -Index $index -Kind $kind -Type $itemType -Phase ([string](Get-CodexFirstValue -InputObject $turnItem -PropertyName @('phase', 'Phase'))) -Summary (Get-CodexEventSummary -Text $text -Fallback $kind) -Text $text -Source 'ThreadRecord' -Timestamp $timestamp -RawEvent $turnItem -IncludeRaw:$IncludeRaw))
+        }
+    }
+
+    return @($events)
+}
+
+function ConvertTo-CodexEventsFromSessionFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ThreadId,
+        [string]$ThreadName,
+        [string]$Project,
+        [switch]$IncludeRaw
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    $events = [System.Collections.Generic.List[object]]::new()
+    $callMetadata = @{}
+    $currentTurnId = $null
+    $resolvedThreadId = $ThreadId
+    $index = 0
+
+    foreach ($line in @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        try {
+            $entry = $line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        $entryType = [string](Get-CodexFirstValue -InputObject $entry -PropertyName @('type', 'Type'))
+        $method = [string](Get-CodexFirstValue -InputObject $entry -PropertyName @('method', 'Method'))
+        $payload = if ($entry.PSObject.Properties['payload']) { $entry.payload } else { $null }
+        $params = if ($entry.PSObject.Properties['params']) { $entry.params } else { $null }
+        $timestamp = ConvertTo-CodexDateTimeOffset -Value (Get-CodexFirstValue -InputObject $entry -PropertyName @('timestamp', 'Timestamp'))
+        $kind = $null
+        $name = $null
+        $phase = $null
+        $summary = $null
+        $text = $null
+        $type = $entryType
+
+        if ($entryType -eq 'session_meta') {
+            if ([string]::IsNullOrWhiteSpace($resolvedThreadId)) {
+                $resolvedThreadId = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('id', 'Id'))
+            }
+            $kind = 'SessionMeta'
+            $summary = 'Session metadata'
+        }
+        elseif ($entryType -eq 'turn_context') {
+            $currentTurnId = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('turn_id', 'turnId', 'TurnId'))
+            $kind = 'TurnContext'
+            $summary = if (-not [string]::IsNullOrWhiteSpace($currentTurnId)) { "Turn context $currentTurnId" } else { 'Turn context' }
+        }
+        elseif ($entryType -eq 'event_msg') {
+            $payloadType = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('type', 'Type'))
+            $type = $payloadType
+            switch ($payloadType) {
+                'task_started' {
+                    $currentTurnId = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('turn_id', 'turnId', 'TurnId'))
+                    $kind = 'TaskStarted'
+                    $summary = 'Task started'
+                }
+                'task_complete' {
+                    $kind = 'TaskCompleted'
+                    $phase = 'final_answer'
+                    $text = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('last_agent_message', 'lastAgentMessage'))
+                    $summary = Get-CodexEventSummary -Text $text -Fallback 'Task completed'
+                }
+                'user_message' {
+                    $kind = 'UserMessage'
+                    $text = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('message', 'Message'))
+                    $summary = Get-CodexEventSummary -Text $text -Fallback 'User message'
+                }
+                'agent_message' {
+                    $kind = 'AgentMessage'
+                    $phase = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('phase', 'Phase'))
+                    $text = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('message', 'Message'))
+                    $summary = Get-CodexEventSummary -Text $text -Fallback 'Agent message'
+                }
+                'agent_reasoning' {
+                    $kind = 'Reasoning'
+                    $phase = 'reasoning'
+                    $text = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('text', 'Text'))
+                    $summary = Get-CodexEventSummary -Text $text -Fallback 'Agent reasoning'
+                }
+                default {
+                    $kind = 'EventMessage'
+                    $name = $payloadType
+                    $summary = if (-not [string]::IsNullOrWhiteSpace($payloadType)) { $payloadType } else { 'Event message' }
+                }
+            }
+        }
+        elseif ($entryType -eq 'response_item') {
+            $payloadType = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('type', 'Type'))
+            $type = $payloadType
+            switch ($payloadType) {
+                'message' {
+                    $role = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('role', 'Role'))
+                    $kind = if ($role -eq 'user') { 'UserMessage' } else { 'AgentMessage' }
+                    $phase = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('phase', 'Phase'))
+                    $text = Get-CodexTranscriptText -InputObject $payload
+                    $summary = Get-CodexEventSummary -Text $text -Fallback $kind
+                }
+                'function_call' {
+                    $callId = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('call_id', 'callId'))
+                    $callName = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('name', 'Name'))
+                    $callArguments = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('arguments', 'Arguments'))
+                    $name = $callName
+                    if ($callName -eq 'shell_command') {
+                        $kind = 'Command'
+                        $phase = 'command'
+                        $summary = Get-CodexShellCommandSummary -Arguments $callArguments
+                    }
+                    else {
+                        $kind = 'ToolCall'
+                        $phase = 'tool'
+                        $summary = Get-CodexToolCallSummary -Name $callName -Arguments $callArguments
+                    }
+                    $text = $summary
+                    if (-not [string]::IsNullOrWhiteSpace($callId)) {
+                        $callMetadata[$callId] = @{
+                            Kind    = $kind
+                            Name    = $callName
+                            Summary = $summary
+                        }
+                    }
+                }
+                'function_call_output' {
+                    $callId = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('call_id', 'callId'))
+                    $output = [string](Get-CodexFirstValue -InputObject $payload -PropertyName @('output', 'Output'))
+                    $callInfo = if (-not [string]::IsNullOrWhiteSpace($callId) -and $callMetadata.ContainsKey($callId)) { $callMetadata[$callId] } else { $null }
+                    $name = if ($callInfo) { [string]$callInfo.Name } else { $callId }
+                    if ($callInfo -and $callInfo.Kind -eq 'Command') {
+                        $kind = 'CommandResult'
+                        $phase = 'command'
+                        $summary = Get-CodexShellCommandResultSummary -CommandSummary ([string]$callInfo.Summary) -Output $output
+                    }
+                    else {
+                        $kind = 'ToolResult'
+                        $phase = 'tool'
+                        $summary = if ($callInfo -and -not [string]::IsNullOrWhiteSpace([string]$callInfo.Summary)) {
+                            'Finished: {0}' -f [string]$callInfo.Summary
+                        }
+                        else {
+                            Get-CodexEventSummary -Text $output -Fallback 'Tool result'
+                        }
+                    }
+                    $text = $output
+                }
+                'reasoning' {
+                    $kind = 'Reasoning'
+                    $phase = 'reasoning'
+                    $text = Get-CodexTranscriptText -InputObject $payload
+                    $summary = Get-CodexEventSummary -Text $text -Fallback 'Reasoning'
+                }
+                default {
+                    $kind = 'ResponseItem'
+                    $name = $payloadType
+                    $summary = if (-not [string]::IsNullOrWhiteSpace($payloadType)) { $payloadType } else { 'Response item' }
+                }
+            }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($method)) {
+            if ($method -like '*/delta') {
+                continue
+            }
+
+            $type = $method
+            switch ($method) {
+                'item/commandExecution/requestApproval' {
+                    $kind = 'ApprovalRequested'
+                    $name = 'commandExecution'
+                    $commandText = [string](Get-CodexNestedFirstValue -InputObject $params -PropertyName @('command', 'Command'))
+                    $summary = if (-not [string]::IsNullOrWhiteSpace($commandText)) {
+                        'Command approval requested: {0}' -f (ConvertTo-CodexTelemetryValueText -Value $commandText -MaxLength 120)
+                    }
+                    else {
+                        'Command approval requested'
+                    }
+                    $text = $commandText
+                }
+                'item/fileChange/requestApproval' {
+                    $kind = 'ApprovalRequested'
+                    $name = 'fileChange'
+                    $pathText = [string](Get-CodexNestedFirstValue -InputObject $params -PropertyName @('path', 'Path', 'filePath', 'file_path'))
+                    $summary = if (-not [string]::IsNullOrWhiteSpace($pathText)) {
+                        'File change approval requested: {0}' -f (ConvertTo-CodexTelemetryValueText -Value $pathText -MaxLength 120)
+                    }
+                    else {
+                        'File change approval requested'
+                    }
+                    $text = $pathText
+                }
+                'turn/completed' {
+                    $kind = 'TurnCompleted'
+                    $summary = 'Turn completed'
+                }
+                'item/completed' {
+                    $kind = 'ItemCompleted'
+                    $item = if ($params -and $params.PSObject.Properties['item']) { $params.item } else { $null }
+                    $name = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('type', 'Type'))
+                    $summary = if (-not [string]::IsNullOrWhiteSpace($name)) { "Item completed: $name" } else { 'Item completed' }
+                }
+                default {
+                    $kind = 'Notification'
+                    $name = $method
+                    $summary = $method
+                }
+            }
+        }
+        else {
+            $kind = 'Unknown'
+            $summary = if (-not [string]::IsNullOrWhiteSpace($entryType)) { $entryType } else { 'Unknown event' }
+        }
+
+        $index++
+        $events.Add((New-CodexEvent -ThreadId $resolvedThreadId -ThreadName $ThreadName -Project $Project -TurnId $currentTurnId -Index $index -Kind $kind -Type $type -Name $name -Phase $phase -Summary $summary -Text $text -Source 'SessionJsonl' -SessionPath $Path -Timestamp $timestamp -RawEvent $entry -IncludeRaw:$IncludeRaw))
+    }
+
+    return @($events)
 }
 
 function ConvertTo-CodexTranscriptItemsFromThreadRecord {
@@ -2902,6 +3338,9 @@ function Get-CodexThread {
 
         $catalog = Import-PSUnpluggedCatalog
         $projectTermsArray = @($projectTerms | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        if ($LocalOnly -and -not $PSBoundParameters.ContainsKey('SpinnerStatus')) {
+            $SpinnerStatus = $null
+        }
 
         return Invoke-PSUnpluggedWithSpinner -Status $SpinnerStatus -ScriptBlock {
             $remoteThreads = @()
@@ -3224,6 +3663,766 @@ function Get-CodexTranscript {
                 }
 
                 return @($results)
+            }
+            finally {
+                if ($createdSession) {
+                    Stop-CodexSession -Session $Session
+                }
+            }
+        }
+    }
+}
+
+function Get-CodexEvent {
+    <#
+    .SYNOPSIS
+        Reads the operational event stream for one or more Codex tasks.
+    .DESCRIPTION
+        Get-CodexEvent projects Codex session JSONL into structured PowerShell
+        objects for operational inspection. Use Receive-CodexTask for task
+        output, Get-CodexTranscript for conversation history, and Get-CodexEvent
+        for what the task did.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [ValidateSet(
+            'AgentMessage',
+            'ApprovalRequested',
+            'Command',
+            'CommandResult',
+            'Error',
+            'EventMessage',
+            'ItemCompleted',
+            'Notification',
+            'Reasoning',
+            'ResponseItem',
+            'SessionMeta',
+            'TaskCompleted',
+            'TaskStarted',
+            'ToolCall',
+            'ToolResult',
+            'TurnCompleted',
+            'TurnContext',
+            'Unknown',
+            'UserMessage'
+        )]
+        [string[]]$Kind,
+        [object]$Since,
+        [switch]$IncludeRaw,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 100,
+        [PSCustomObject]$Session,
+        [Parameter(DontShow = $true)][string]$SpinnerStatus = 'Loading Codex events...'
+    )
+
+    begin {
+        $inputs = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            $inputs.Add($InputObject)
+        }
+    }
+
+    end {
+        $taskLookup = [ordered]@{}
+        foreach ($taskId in @($Id)) {
+            if ([string]::IsNullOrWhiteSpace([string]$taskId)) {
+                continue
+            }
+
+            $resolvedId = Resolve-CodexTaskIdentifierText -Id ([string]$taskId)
+            if (-not [string]::IsNullOrWhiteSpace($resolvedId)) {
+                $taskLookup[$resolvedId] = [PSCustomObject]@{
+                    TaskId   = $resolvedId
+                    ThreadId = $resolvedId
+                }
+            }
+        }
+
+        foreach ($item in @($inputs)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $item
+            if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                $taskLookup[$taskId] = $item
+            }
+        }
+
+        $hasExplicitTask = $taskLookup.Count -gt 0
+        $effectiveProject = $Project
+        if (-not $hasExplicitTask -and [string]::IsNullOrWhiteSpace($effectiveProject)) {
+            $effectiveProject = (Get-Location).Path
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($effectiveProject)) {
+            foreach ($task in @(Get-CodexTask -Project $effectiveProject -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 0 -Session $Session -SpinnerStatus $null)) {
+                $taskId = Resolve-CodexTaskIdentifier -InputObject $task
+                if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                    $taskLookup[$taskId] = $task
+                }
+            }
+        }
+
+        if ($taskLookup.Count -eq 0) {
+            return
+        }
+
+        $kindFilter = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($kindEntry in @($Kind)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$kindEntry)) {
+                $null = $kindFilter.Add(([string]$kindEntry).Trim())
+            }
+        }
+
+        $sinceTimestamp = ConvertTo-CodexDateTimeOffset -Value $Since
+
+        return Invoke-PSUnpluggedWithSpinner -Status $SpinnerStatus -ScriptBlock {
+            $createdSession = $false
+            $results = [System.Collections.Generic.List[object]]::new()
+
+            try {
+                if (-not $LocalOnly -and -not $Session) {
+                    $Session = Start-CodexSession
+                    $createdSession = $true
+                }
+
+                foreach ($taskEntry in @($taskLookup.Values)) {
+                    if ($null -eq $taskEntry) {
+                        continue
+                    }
+
+                    $taskId = Resolve-CodexTaskIdentifier -InputObject $taskEntry
+                    if ([string]::IsNullOrWhiteSpace($taskId)) {
+                        continue
+                    }
+
+                    $task = if ($taskEntry.PSObject.TypeNames -contains 'PSUnplugged.CodexTask') {
+                        $taskEntry
+                    }
+                    else {
+                        Get-CodexTask -Id $taskId -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+                        Select-Object -First 1
+                    }
+                    if (-not $task) {
+                        $task = $taskEntry
+                    }
+
+                    $threadName = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Name', 'name', 'ThreadName', 'threadName'))
+                    $projectName = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Project', 'project', 'ProjectName', 'projectName'))
+                    $rawThread = Get-CodexFirstValue -InputObject $task -PropertyName @('RawThread', 'rawThread')
+                    $sessionPath = [string](Get-CodexFirstValue -InputObject $rawThread -PropertyName @('path', 'Path'))
+                    if ([string]::IsNullOrWhiteSpace($sessionPath)) {
+                        $sessionPath = Resolve-CodexSessionPath -ThreadId $taskId
+                    }
+
+                    $taskEvents = @()
+                    if (-not [string]::IsNullOrWhiteSpace($sessionPath) -and (Test-Path -LiteralPath $sessionPath)) {
+                        $taskEvents = @(ConvertTo-CodexEventsFromSessionFile -Path $sessionPath -ThreadId $taskId -ThreadName $threadName -Project $projectName -IncludeRaw:$IncludeRaw)
+                    }
+
+                    if ($taskEvents.Count -eq 0 -and -not $LocalOnly -and $Session) {
+                        try {
+                            $threadRecord = Get-CodexThreadRecord -Session $Session -ThreadId $taskId -IncludeTurns
+                            if ($threadRecord -and $threadRecord.thread) {
+                                if ([string]::IsNullOrWhiteSpace($threadName)) {
+                                    $threadName = Get-CodexThreadTitle -Thread $threadRecord.thread
+                                }
+                                $taskEvents = @(ConvertTo-CodexEventsFromThreadRecord -Thread $threadRecord.thread -ThreadName $threadName -Project $projectName -IncludeRaw:$IncludeRaw)
+                            }
+                        }
+                        catch {
+                        }
+                    }
+
+                    foreach ($event in @($taskEvents)) {
+                        if ($kindFilter.Count -gt 0) {
+                            $eventKind = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Kind', 'kind'))
+                            if ([string]::IsNullOrWhiteSpace($eventKind) -or -not $kindFilter.Contains($eventKind)) {
+                                continue
+                            }
+                        }
+
+                        if ($sinceTimestamp) {
+                            $eventTimestamp = ConvertTo-CodexDateTimeOffset -Value (Get-CodexFirstValue -InputObject $event -PropertyName @('Timestamp', 'timestamp'))
+                            if (-not $eventTimestamp -or $eventTimestamp -lt $sinceTimestamp) {
+                                continue
+                            }
+                        }
+
+                        $results.Add($event)
+                    }
+                }
+
+                $sorted = @(
+                    $results |
+                    Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.TaskId } }, @{ Expression = { $_.Index } }
+                )
+
+                if ($Limit -gt 0 -and $sorted.Count -gt $Limit) {
+                    $sorted = @($sorted | Select-Object -Last $Limit)
+                }
+
+                return $sorted
+            }
+            finally {
+                if ($createdSession) {
+                    Stop-CodexSession -Session $Session
+                }
+            }
+        }
+    }
+}
+
+function ConvertTo-CodexApprovalOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline = $true)]
+        $InputObject,
+        [switch]$IncludeRaw
+    )
+
+    process {
+        if ($null -eq $InputObject) {
+            return
+        }
+
+        $rawEvent = Get-CodexFirstValue -InputObject $InputObject -PropertyName @('RawEvent', 'rawEvent')
+        $rawParams = Get-CodexFirstValue -InputObject $rawEvent -PropertyName @('params', 'Params')
+        $eventName = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Name', 'name'))
+        $eventType = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Type', 'type'))
+        if ([string]::IsNullOrWhiteSpace($eventType)) {
+            $eventType = [string](Get-CodexFirstValue -InputObject $rawEvent -PropertyName @('method', 'Method'))
+        }
+
+        $approvalType = if ($eventName -eq 'commandExecution' -or $eventType -like '*commandExecution/requestApproval') {
+            'CommandExecution'
+        }
+        elseif ($eventName -eq 'fileChange' -or $eventType -like '*fileChange/requestApproval') {
+            'FileChange'
+        }
+        else {
+            'Unknown'
+        }
+
+        $commandText = [string](Get-CodexNestedFirstValue -InputObject $rawParams -PropertyName @('command', 'Command'))
+        $pathText = [string](Get-CodexNestedFirstValue -InputObject $rawParams -PropertyName @('path', 'Path', 'filePath', 'file_path'))
+        $reasonText = [string](Get-CodexNestedFirstValue -InputObject $rawParams -PropertyName @('reason', 'Reason', 'message', 'Message', 'description', 'Description'))
+        $target = if (-not [string]::IsNullOrWhiteSpace($commandText)) {
+            $commandText
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($pathText)) {
+            $pathText
+        }
+        else {
+            [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Text', 'text', 'Summary', 'summary'))
+        }
+
+        $approvalId = [string](Get-CodexFirstValue -InputObject $rawEvent -PropertyName @('id', 'Id'))
+        if ([string]::IsNullOrWhiteSpace($approvalId)) {
+            $approvalId = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Id', 'id'))
+        }
+
+        $approval = [PSCustomObject]@{
+            Id           = $approvalId
+            TaskId       = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('TaskId', 'taskId', 'ThreadId', 'threadId'))
+            ThreadId     = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('ThreadId', 'threadId', 'TaskId', 'taskId'))
+            ThreadName   = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('ThreadName', 'threadName'))
+            Project      = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Project', 'project'))
+            TurnId       = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('TurnId', 'turnId'))
+            Status       = 'Requested'
+            ApprovalType = $approvalType
+            Target       = $target
+            Command      = $commandText
+            Path         = $pathText
+            Reason       = $reasonText
+            Summary      = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Summary', 'summary'))
+            Timestamp    = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('Timestamp', 'timestamp'))
+            When         = [string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('When', 'when'))
+            SourceEvent  = $InputObject
+        }
+
+        if ($IncludeRaw) {
+            $approval | Add-Member -NotePropertyName RawEvent -NotePropertyValue $rawEvent -Force
+            $approval.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexApproval.Raw')
+            $approval.PSObject.TypeNames.Insert(1, 'PSUnplugged.CodexApproval')
+        }
+        else {
+            $approval.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexApproval')
+        }
+
+        return $approval
+    }
+}
+
+function Get-CodexApproval {
+    <#
+    .SYNOPSIS
+        Reads approval requests observed for one or more Codex tasks.
+    .DESCRIPTION
+        Get-CodexApproval is a read-only approval view. It projects approval
+        request events into PowerShell objects. It does not approve or deny
+        requests; live approval handling is a separate control-flow concern.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [ValidateSet('CommandExecution', 'FileChange', 'Unknown')]
+        [string[]]$ApprovalType,
+        [ValidateSet('Requested')]
+        [string[]]$Status,
+        [object]$Since,
+        [switch]$IncludeRaw,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 100,
+        [PSCustomObject]$Session,
+        [Parameter(DontShow = $true)][string]$SpinnerStatus = 'Loading Codex approvals...'
+    )
+
+    begin {
+        $inputs = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            $inputs.Add($InputObject)
+        }
+    }
+
+    end {
+        $eventParams = @{
+            Kind          = 'ApprovalRequested'
+            IncludeRaw    = $true
+            Limit         = 0
+            SpinnerStatus = $SpinnerStatus
+        }
+        if ($Id) { $eventParams.Id = $Id }
+        if ($Project) { $eventParams.Project = $Project }
+        if ($Since) { $eventParams.Since = $Since }
+        if ($IncludeArchived) { $eventParams.IncludeArchived = $true }
+        if ($LocalOnly) { $eventParams.LocalOnly = $true }
+        if ($Session) { $eventParams.Session = $Session }
+
+        $events = if ($inputs.Count -gt 0) {
+            @($inputs | Get-CodexEvent @eventParams)
+        }
+        else {
+            @(Get-CodexEvent @eventParams)
+        }
+
+        $typeFilter = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in @($ApprovalType)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$entry)) {
+                $null = $typeFilter.Add(([string]$entry).Trim())
+            }
+        }
+
+        $statusFilter = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in @($Status)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$entry)) {
+                $null = $statusFilter.Add(([string]$entry).Trim())
+            }
+        }
+
+        $approvals = @(
+            foreach ($approval in @($events | ConvertTo-CodexApprovalOutput -IncludeRaw:$IncludeRaw)) {
+                if ($typeFilter.Count -gt 0 -and -not $typeFilter.Contains([string]$approval.ApprovalType)) {
+                    continue
+                }
+                if ($statusFilter.Count -gt 0 -and -not $statusFilter.Contains([string]$approval.Status)) {
+                    continue
+                }
+
+                $approval
+            }
+        )
+
+        if ($Limit -gt 0 -and $approvals.Count -gt $Limit) {
+            return @($approvals | Select-Object -Last $Limit)
+        }
+
+        return $approvals
+    }
+}
+
+function Get-CodexArtifactTextSize {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Text
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return 0
+    }
+
+    return [System.Text.Encoding]::UTF8.GetByteCount($Text)
+}
+
+function ConvertTo-CodexArtifactTranscriptText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object[]]$Transcript
+    )
+
+    $blocks = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($Transcript | Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } })) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $text = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Text', 'text'))
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($propertyName in @('When', 'Role', 'Phase')) {
+            $value = [string](Get-CodexFirstValue -InputObject $item -PropertyName @($propertyName, $propertyName.ToLowerInvariant()))
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                $parts.Add($value)
+            }
+        }
+
+        $label = if ($parts.Count -gt 0) { '[' + ($parts -join ' | ') + ']' } else { '[transcript]' }
+        $blocks.Add(($label + "`n" + $text.Trim()))
+    }
+
+    return ($blocks -join "`n`n")
+}
+
+function ConvertTo-CodexArtifactEventText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object[]]$Event
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($Event | Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } })) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($propertyName in @('When', 'Kind', 'Name')) {
+            $value = [string](Get-CodexFirstValue -InputObject $item -PropertyName @($propertyName, $propertyName.ToLowerInvariant()))
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                $parts.Add($value)
+            }
+        }
+
+        $label = if ($parts.Count -gt 0) { '[' + ($parts -join ' | ') + ']' } else { '[event]' }
+        $summary = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Summary', 'summary', 'Text', 'text'))
+        if ([string]::IsNullOrWhiteSpace($summary)) {
+            $summary = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Type', 'type'))
+        }
+
+        $lines.Add(('{0} {1}' -f $label, $summary).Trim())
+    }
+
+    return ($lines -join "`n")
+}
+
+function Get-CodexLatestTimestamp {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object[]]$InputObject
+    )
+
+    $latest = $null
+    foreach ($item in @($InputObject)) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $timestamp = ConvertTo-CodexDateTimeOffset -Value (Get-CodexFirstValue -InputObject $item -PropertyName @('Timestamp', 'timestamp', 'LastActivityAt', 'lastActivityAt', 'UpdatedAt', 'updatedAt'))
+        if ($timestamp -and ($null -eq $latest -or $timestamp -gt $latest)) {
+            $latest = $timestamp
+        }
+    }
+
+    return $latest
+}
+
+function New-CodexArtifact {
+    [CmdletBinding()]
+    param(
+        [string]$ThreadId,
+        [string]$ThreadName,
+        [string]$Project,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Path,
+        [string]$Summary,
+        [Nullable[Int64]]$Size,
+        [Nullable[Int32]]$ItemCount,
+        [AllowNull()][Nullable[DateTimeOffset]]$Timestamp,
+        [string]$Source,
+        [AllowNull()]$Content,
+        [switch]$IncludeContent
+    )
+
+    $timestampValue = if ($null -ne $Timestamp) { [DateTimeOffset]$Timestamp } else { $null }
+    $artifactName = if ([string]::IsNullOrWhiteSpace($Name)) { $Kind } else { $Name }
+    $artifactId = if (-not [string]::IsNullOrWhiteSpace($ThreadId)) {
+        '{0}:{1}:{2}' -f (Get-CodexCompactId -Id $ThreadId -Length 8), $Kind, (Get-CodexSafeFileName -Name $artifactName -Fallback 'artifact')
+    }
+    else {
+        '{0}:{1}' -f $Kind, (Get-CodexSafeFileName -Name $artifactName -Fallback 'artifact')
+    }
+
+    $artifact = [PSCustomObject]@{
+        Id         = $artifactId
+        TaskId     = $ThreadId
+        ThreadId   = $ThreadId
+        ThreadName = $ThreadName
+        Project    = $Project
+        Kind       = $Kind
+        Name       = $artifactName
+        Path       = $Path
+        Size       = if ($null -ne $Size) { [Int64]$Size } else { $null }
+        ItemCount  = if ($null -ne $ItemCount) { [Int32]$ItemCount } else { $null }
+        Timestamp  = if ($null -ne $timestampValue) { $timestampValue.ToString('o') } else { $null }
+        When       = if ($null -ne $timestampValue) { Get-CodexDisplayTimestamp -Timestamp $timestampValue } else { $null }
+        Summary    = $Summary
+        Source     = $Source
+    }
+
+    if ($IncludeContent) {
+        $artifact | Add-Member -NotePropertyName Content -NotePropertyValue $Content -Force
+        $artifact.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexArtifact.Content')
+        $artifact.PSObject.TypeNames.Insert(1, 'PSUnplugged.CodexArtifact')
+    }
+    else {
+        $artifact.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexArtifact')
+    }
+
+    return $artifact
+}
+
+function Get-CodexArtifact {
+    <#
+    .SYNOPSIS
+        Reads durable artifacts and materialized task views for Codex tasks.
+    .DESCRIPTION
+        Get-CodexArtifact projects existing Codex task state into artifact-like
+        PowerShell objects. It does not create a separate artifact registry; it
+        exposes the durable session file plus derived result, transcript, and
+        event-log views.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [ValidateSet('SessionFile', 'ResultText', 'Transcript', 'EventLog')]
+        [string[]]$Kind,
+        [switch]$IncludeContent,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 100,
+        [PSCustomObject]$Session,
+        [Parameter(DontShow = $true)][string]$SpinnerStatus = 'Loading Codex artifacts...'
+    )
+
+    begin {
+        $inputs = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            $inputs.Add($InputObject)
+        }
+    }
+
+    end {
+        $taskLookup = [ordered]@{}
+        foreach ($taskId in @($Id)) {
+            if ([string]::IsNullOrWhiteSpace([string]$taskId)) {
+                continue
+            }
+
+            $resolvedId = Resolve-CodexTaskIdentifierText -Id ([string]$taskId)
+            if (-not [string]::IsNullOrWhiteSpace($resolvedId)) {
+                $taskLookup[$resolvedId] = [PSCustomObject]@{
+                    TaskId   = $resolvedId
+                    ThreadId = $resolvedId
+                }
+            }
+        }
+
+        foreach ($item in @($inputs)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $item
+            if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                $taskLookup[$taskId] = $item
+            }
+        }
+
+        $hasExplicitTask = $taskLookup.Count -gt 0
+        $effectiveProject = $Project
+        if (-not $hasExplicitTask -and [string]::IsNullOrWhiteSpace($effectiveProject)) {
+            $effectiveProject = (Get-Location).Path
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($effectiveProject)) {
+            foreach ($task in @(Get-CodexTask -Project $effectiveProject -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 0 -Session $Session -SpinnerStatus $null)) {
+                $taskId = Resolve-CodexTaskIdentifier -InputObject $task
+                if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                    $taskLookup[$taskId] = $task
+                }
+            }
+        }
+
+        if ($taskLookup.Count -eq 0) {
+            return
+        }
+
+        $kindFilter = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($kindEntry in @($Kind)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$kindEntry)) {
+                $null = $kindFilter.Add(([string]$kindEntry).Trim())
+            }
+        }
+
+        return Invoke-PSUnpluggedWithSpinner -Status $SpinnerStatus -ScriptBlock {
+            $createdSession = $false
+            $results = [System.Collections.Generic.List[object]]::new()
+
+            try {
+                if (-not $LocalOnly -and -not $Session) {
+                    $Session = Start-CodexSession
+                    $createdSession = $true
+                }
+
+                foreach ($taskEntry in @($taskLookup.Values)) {
+                    if ($null -eq $taskEntry) {
+                        continue
+                    }
+
+                    $taskId = Resolve-CodexTaskIdentifier -InputObject $taskEntry
+                    if ([string]::IsNullOrWhiteSpace($taskId)) {
+                        continue
+                    }
+
+                    $task = if ($taskEntry.PSObject.TypeNames -contains 'PSUnplugged.CodexTask') {
+                        $taskEntry
+                    }
+                    else {
+                        Get-CodexTask -Id $taskId -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+                        Select-Object -First 1
+                    }
+                    if (-not $task) {
+                        $task = $taskEntry
+                    }
+
+                    $threadName = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Name', 'name', 'ThreadName', 'threadName'))
+                    $projectName = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Project', 'project', 'ProjectName', 'projectName'))
+                    $sessionPath = Resolve-CodexTaskSessionPath -InputObject $task
+                    $taskTimestamp = ConvertTo-CodexDateTimeOffset -Value (Get-CodexFirstValue -InputObject $task -PropertyName @('LastActivityAt', 'lastActivityAt', 'UpdatedAt', 'updatedAt', 'Timestamp', 'timestamp'))
+
+                    if (($kindFilter.Count -eq 0 -or $kindFilter.Contains('SessionFile')) -and -not [string]::IsNullOrWhiteSpace($sessionPath) -and (Test-Path -LiteralPath $sessionPath)) {
+                        $fileInfo = Get-Item -LiteralPath $sessionPath -ErrorAction SilentlyContinue
+                        if ($fileInfo) {
+                            $content = if ($IncludeContent) { Get-Content -LiteralPath $sessionPath -Raw -ErrorAction SilentlyContinue } else { $null }
+                            $results.Add((New-CodexArtifact -ThreadId $taskId -ThreadName $threadName -Project $projectName -Kind 'SessionFile' -Name $fileInfo.Name -Path $fileInfo.FullName -Summary ('Codex session JSONL ({0} bytes)' -f $fileInfo.Length) -Size ([Int64]$fileInfo.Length) -ItemCount $null -Timestamp (ConvertTo-CodexDateTimeOffset -Value $fileInfo.LastWriteTimeUtc) -Source 'SessionJsonl' -Content $content -IncludeContent:$IncludeContent))
+                        }
+                    }
+
+                    if ($kindFilter.Count -eq 0 -or $kindFilter.Contains('ResultText')) {
+                        $receiveParams = @{
+                            Limit = 25
+                        }
+                        if ($IncludeArchived) { $receiveParams.IncludeArchived = $true }
+                        if ($LocalOnly) { $receiveParams.LocalOnly = $true }
+                        if ($Session) { $receiveParams.Session = $Session }
+
+                        $latestOutput = @($task | Receive-CodexTask @receiveParams) | Select-Object -First 1
+                        if ($latestOutput) {
+                            $text = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Text', 'text'))
+                            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                                $summary = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Summary', 'summary'))
+                                if ([string]::IsNullOrWhiteSpace($summary)) {
+                                    $summary = Get-CodexTaskReceiveSummary -Text $text
+                                }
+
+                                $timestamp = ConvertTo-CodexDateTimeOffset -Value (Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Timestamp', 'timestamp'))
+                                if (-not $timestamp) {
+                                    $timestamp = $taskTimestamp
+                                }
+
+                                $results.Add((New-CodexArtifact -ThreadId $taskId -ThreadName $threadName -Project $projectName -Kind 'ResultText' -Name 'latest-output.md' -Path $null -Summary $summary -Size (Get-CodexArtifactTextSize -Text $text) -ItemCount 1 -Timestamp $timestamp -Source 'Receive-CodexTask' -Content $text -IncludeContent:$IncludeContent))
+                            }
+                        }
+                    }
+
+                    if ($kindFilter.Count -eq 0 -or $kindFilter.Contains('Transcript')) {
+                        $transcriptParams = @{
+                            Limit         = 25
+                            SpinnerStatus = $null
+                        }
+                        if ($IncludeArchived) { $transcriptParams.IncludeArchived = $true }
+                        if ($LocalOnly) { $transcriptParams.LocalOnly = $true }
+                        if ($Session) { $transcriptParams.Session = $Session }
+
+                        $transcript = @(Get-CodexTranscript -Id $taskId @transcriptParams)
+                        if ($transcript.Count -gt 0) {
+                            $content = if ($IncludeContent) { ConvertTo-CodexArtifactTranscriptText -Transcript $transcript } else { $null }
+                            $size = if ($IncludeContent) { Get-CodexArtifactTextSize -Text $content } else { $null }
+                            $timestamp = Get-CodexLatestTimestamp -InputObject $transcript
+                            if (-not $timestamp) {
+                                $timestamp = $taskTimestamp
+                            }
+
+                            $results.Add((New-CodexArtifact -ThreadId $taskId -ThreadName $threadName -Project $projectName -Kind 'Transcript' -Name 'transcript.md' -Path $null -Summary ('{0} transcript item(s)' -f $transcript.Count) -Size $size -ItemCount $transcript.Count -Timestamp $timestamp -Source 'Get-CodexTranscript' -Content $content -IncludeContent:$IncludeContent))
+                        }
+                    }
+
+                    if ($kindFilter.Count -eq 0 -or $kindFilter.Contains('EventLog')) {
+                        $eventParams = @{
+                            Limit         = 0
+                            SpinnerStatus = $null
+                        }
+                        if ($IncludeArchived) { $eventParams.IncludeArchived = $true }
+                        if ($LocalOnly) { $eventParams.LocalOnly = $true }
+                        if ($Session) { $eventParams.Session = $Session }
+
+                        $events = @($task | Get-CodexEvent @eventParams)
+                        if ($events.Count -gt 0) {
+                            $content = if ($IncludeContent) { ConvertTo-CodexArtifactEventText -Event $events } else { $null }
+                            $size = if ($IncludeContent) { Get-CodexArtifactTextSize -Text $content } else { $null }
+                            $timestamp = Get-CodexLatestTimestamp -InputObject $events
+                            if (-not $timestamp) {
+                                $timestamp = $taskTimestamp
+                            }
+
+                            $results.Add((New-CodexArtifact -ThreadId $taskId -ThreadName $threadName -Project $projectName -Kind 'EventLog' -Name 'events.log' -Path $null -Summary ('{0} event(s)' -f $events.Count) -Size $size -ItemCount $events.Count -Timestamp $timestamp -Source 'Get-CodexEvent' -Content $content -IncludeContent:$IncludeContent))
+                        }
+                    }
+                }
+
+                $sorted = @(
+                    $results |
+                    Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.TaskId } }, @{ Expression = { $_.Kind } }
+                )
+
+                if ($Limit -gt 0 -and $sorted.Count -gt $Limit) {
+                    $sorted = @($sorted | Select-Object -Last $Limit)
+                }
+
+                return $sorted
             }
             finally {
                 if ($createdSession) {
@@ -3871,6 +5070,1472 @@ function Show-CodexTranscript {
                 Opened      = (-not $NoOpen)
             }
             $page.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTranscriptPage')
+            return $page
+        }
+    }
+}
+
+function New-CodexTaskDashboardHtmlPath {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Task = @(),
+        [string]$Title
+    )
+
+    $Task = @($Task | Where-Object { $null -ne $_ })
+
+    $root = Join-Path (Get-PSUnpluggedDataRoot) 'dashboards'
+    if (-not (Test-Path -LiteralPath $root)) {
+        $null = New-Item -ItemType Directory -Path $root -Force
+    }
+
+    $projectNames = @(
+        $Task |
+        ForEach-Object { [string](Get-CodexFirstValue -InputObject $_ -PropertyName @('Project', 'project', 'ProjectName', 'projectName')) } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+    )
+
+    $baseName = if (-not [string]::IsNullOrWhiteSpace($Title)) {
+        $Title
+    }
+    elseif ($projectNames.Count -eq 1) {
+        '{0}-codex-dashboard' -f $projectNames[0]
+    }
+    else {
+        'codex-task-dashboard'
+    }
+
+    $safeName = Get-CodexSafeFileName -Name $baseName
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    return (Join-Path $root "$stamp-$safeName.html")
+}
+
+function New-CodexTaskDashboardData {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Task = @(),
+        [string]$Title
+    )
+
+    $Task = @($Task | Where-Object { $null -ne $_ })
+
+    $pageTitle = if ([string]::IsNullOrWhiteSpace($Title)) { 'Codex Task Dashboard' } else { $Title }
+    $taskCount = $Task.Count
+    $activeCount = @($Task | Where-Object { [string]$_.status -in @('active', 'starting', 'running') }).Count
+    $failedCount = @($Task | Where-Object { [string]$_.status -in @('failed', 'error', 'canceled') }).Count
+    $attentionCount = @($Task | Where-Object { ([int]$_.approvalCount -gt 0) -or -not [string]::IsNullOrWhiteSpace([string]$_.lastErrorMessage) }).Count
+
+    $data = [PSCustomObject]@{
+        title          = $pageTitle
+        generatedAt    = (Get-Date).ToString('o')
+        taskCount      = $taskCount
+        activeCount    = $activeCount
+        failedCount    = $failedCount
+        attentionCount = $attentionCount
+        projects       = @($Task.project | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique)
+        statuses       = @($Task.status | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique)
+        tasks          = @($Task)
+    }
+
+    $data.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTaskDashboardData')
+    return $data
+}
+
+function ConvertTo-CodexTaskDashboardHtml {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Task = @(),
+        [AllowNull()]$Data,
+        [string]$Title
+    )
+
+    $dashboardData = if ($null -ne $Data) {
+        $Data
+    }
+    else {
+        New-CodexTaskDashboardData -Task @($Task) -Title $Title
+    }
+
+    $pageTitle = [string](Get-CodexFirstValue -InputObject $dashboardData -PropertyName @('title', 'Title'))
+    if ([string]::IsNullOrWhiteSpace($pageTitle)) {
+        $pageTitle = if ([string]::IsNullOrWhiteSpace($Title)) { 'Codex Task Dashboard' } else { $Title }
+    }
+
+    $json = ($dashboardData | ConvertTo-Json -Depth 12)
+    $json = $json -replace '</script>', '<\/script>'
+    $encodedTitle = [System.Net.WebUtility]::HtmlEncode($pageTitle)
+
+    return @"
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>$encodedTitle</title>
+  <style>
+    :root {
+      --bg: #f3f5f4;
+      --surface: #ffffff;
+      --surface-soft: #edf0ee;
+      --ink: #151e1b;
+      --muted: #5f6d6a;
+      --line: #d5dbd8;
+      --accent: #0b7f8d;
+      --accent-soft: #e0f4f6;
+      --ok: #2e7a31;
+      --ok-bg: #e8f5e9; --ok-bd: #c6e6c8;
+      --warn: #975f05;
+      --warn-bg: #fff8e1; --warn-bd: #f8d97a;
+      --danger: #b61b1b;
+      --danger-bg: #fef2f2; --danger-bd: #fbbfbf;
+      --info: #1a4fd6;
+      --info-bg: #eff6ff; --info-bd: #bcd4fe;
+      --mono: "Cascadia Code","SFMono-Regular",Consolas,monospace;
+      --r: 8px;
+      --tr: 120ms ease;
+    }
+    [data-theme="dark"] {
+      --bg: #0d1311;
+      --surface: #141c19;
+      --surface-soft: #1b2421;
+      --ink: #dce8e4;
+      --muted: #7a9590;
+      --line: #253330;
+      --accent: #1fb3c2;
+      --accent-soft: #0b3039;
+      --ok: #43a047;
+      --ok-bg: #162318; --ok-bd: #2a5c2d;
+      --warn: #f59e0b;
+      --warn-bg: #1c1600; --warn-bd: #5c440f;
+      --danger: #f87171;
+      --danger-bg: #260f0f; --danger-bd: #6b1c1c;
+      --info: #60a5fa;
+      --info-bg: #0d1a35; --info-bd: #1e3d7a;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh;
+      background: var(--bg); color: var(--ink);
+      font-family: "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+      font-size: 14px;
+      transition: background var(--tr), color var(--tr);
+    }
+    button, input, select { font: inherit; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+    .app {
+      display: grid;
+      grid-template-columns: 380px minmax(0,1fr);
+      min-height: 100vh;
+    }
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: var(--surface);
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto auto auto minmax(0,1fr);
+      overflow: hidden;
+    }
+    .brand {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .brand-text { flex: 1; min-width: 0; }
+    .brand h1 {
+      margin: 0; font-size: 16px; line-height: 1.25;
+      color: var(--accent);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .generated { color: var(--muted); margin-top: 4px; font-size: 12px; }
+    .theme-btn {
+      flex-shrink: 0;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 4px 9px;
+      cursor: pointer; font-size: 14px; line-height: 1;
+      color: var(--ink);
+      transition: background var(--tr);
+      user-select: none;
+    }
+    .theme-btn:hover { background: var(--accent-soft); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4,minmax(0,1fr));
+      gap: 1px; background: var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .metric {
+      background: var(--surface);
+      padding: 10px 10px; min-width: 0;
+      cursor: pointer;
+      transition: background var(--tr);
+    }
+    .metric:hover { background: var(--surface-soft); }
+    .metric.active-filter { background: var(--accent-soft); }
+    .metric span {
+      display: block; color: var(--muted);
+      font-size: 11px; line-height: 1.2;
+      text-transform: uppercase; letter-spacing: .04em;
+    }
+    .metric strong {
+      display: block; margin-top: 5px;
+      font-size: 22px; line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .metric.m-active strong { color: var(--info); }
+    .metric.m-failed strong { color: var(--danger); }
+    .metric.m-attn strong { color: var(--warn); }
+    .filters {
+      padding: 10px 12px;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 7px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-soft);
+      min-height: 0;
+    }
+    .nlp-row {
+      grid-column: 1 / -1;
+      display: grid; grid-template-columns: minmax(0,1fr) 58px; gap: 7px;
+    }
+    .search-row { grid-column: 1 / -1; }
+    .filters input, .filters select, .filters button {
+      width: 100%; min-width: 0;
+      border: 1px solid var(--line);
+      background: var(--surface); color: var(--ink);
+      border-radius: 6px; padding: 7px 10px; outline: none;
+      transition: border-color var(--tr), box-shadow var(--tr);
+    }
+    .filters button {
+      cursor: pointer; font-weight: 650;
+      background: var(--accent); color: white; border-color: var(--accent);
+    }
+    .filters button:hover { opacity: .88; }
+    .filters input:focus, .filters select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .task-list {
+      overflow-y: auto; padding: 8px;
+      display: flex; flex-direction: column; gap: 6px;
+      min-height: 0;
+    }
+    .task-card {
+      width: 100%; text-align: left;
+      border: 1px solid var(--line);
+      background: var(--surface); color: var(--ink);
+      border-radius: var(--r); padding: 11px 12px;
+      cursor: pointer; outline: none;
+      transition: border-color var(--tr), box-shadow var(--tr), background var(--tr);
+    }
+    .task-card:hover { border-color: #9db6b0; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+    .task-card:focus-visible { box-shadow: 0 0 0 3px var(--accent-soft); border-color: var(--accent); }
+    .task-card.selected {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .task-title-row { display: flex; gap: 7px; align-items: center; min-width: 0; }
+    .task-title {
+      min-width: 0; flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-weight: 650; font-size: 13px;
+    }
+    .task-meta {
+      display: flex; gap: 6px; flex-wrap: wrap;
+      color: var(--muted); margin-top: 7px; font-size: 12px;
+    }
+    .task-meta-sep { opacity: .35; }
+    .preview {
+      margin-top: 9px; padding: 8px 10px;
+      border-radius: 6px;
+      background: #1a201e; color: #d4e8e3;
+      font-family: var(--mono); font-size: 11.5px; line-height: 1.45;
+      max-height: 50px; overflow: hidden; white-space: pre-wrap;
+    }
+    [data-theme="dark"] .preview { background: #0b1210; color: #b8d4cf; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      min-height: 20px; border-radius: 999px;
+      padding: 2px 8px; font-size: 11px; font-weight: 700;
+      line-height: 1.3; border: 1px solid transparent; white-space: nowrap;
+    }
+    .pill-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .pill.completed { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-bd); }
+    .pill.completed .pill-dot { background: var(--ok); }
+    .pill.active, .pill.starting, .pill.running {
+      color: var(--info); background: var(--info-bg); border-color: var(--info-bd);
+    }
+    .pill.active .pill-dot, .pill.starting .pill-dot, .pill.running .pill-dot {
+      background: var(--info);
+      animation: blink 1.8s ease-in-out infinite;
+    }
+    .pill.failed, .pill.error, .pill.canceled {
+      color: var(--danger); background: var(--danger-bg); border-color: var(--danger-bd);
+    }
+    .pill.failed .pill-dot, .pill.error .pill-dot, .pill.canceled .pill-dot { background: var(--danger); }
+    .pill.archived { color: var(--muted); background: var(--surface-soft); border-color: var(--line); }
+    .pill.archived .pill-dot { background: var(--muted); }
+    .pill.attention { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-bd); }
+    .pill.attention .pill-dot { background: var(--warn); animation: blink 1.2s ease-in-out infinite; }
+    @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:.2; } }
+    .content {
+      min-width: 0;
+      display: grid; grid-template-rows: auto auto 1fr;
+      overflow: hidden;
+    }
+    .topbar {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+      display: grid; grid-template-columns: minmax(0,1fr) auto;
+      gap: 16px; align-items: center;
+    }
+    .selected-title { margin: 0; font-size: 19px; line-height: 1.25; overflow-wrap: anywhere; }
+    .selected-subtitle {
+      margin-top: 4px; color: var(--muted); font-size: 12px;
+      overflow-wrap: anywhere; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    }
+    .copy-id-btn {
+      background: var(--surface-soft); border: 1px solid var(--line);
+      border-radius: 5px; padding: 2px 8px; cursor: pointer;
+      font-size: 11px; color: var(--muted);
+      transition: background var(--tr), color var(--tr);
+    }
+    .copy-id-btn:hover { background: var(--accent-soft); color: var(--accent); }
+    .segmented {
+      display: inline-flex;
+      border: 1px solid var(--line); border-radius: var(--r);
+      overflow: hidden; background: var(--surface-soft);
+    }
+    .segmented button {
+      border: 0; border-right: 1px solid var(--line);
+      background: transparent; color: var(--ink);
+      padding: 7px 12px; cursor: pointer; min-width: 74px;
+      transition: background var(--tr), color var(--tr); font-size: 13px;
+    }
+    .segmented button:last-child { border-right: 0; }
+    .segmented button:hover { background: var(--accent-soft); }
+    .segmented button.active { background: var(--accent); color: white; }
+    .summary-strip {
+      display: grid; grid-template-columns: repeat(5,minmax(0,1fr));
+      border-bottom: 1px solid var(--line); background: var(--surface);
+    }
+    .summary-cell { border-right: 1px solid var(--line); padding: 10px 14px; min-width: 0; }
+    .summary-cell:last-child { border-right: 0; }
+    .summary-cell span {
+      display: block; color: var(--muted); font-size: 11px;
+      text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px;
+    }
+    .summary-cell strong {
+      display: block; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; font-size: 13px;
+    }
+    .view { min-height: 0; overflow-y: auto; padding: 16px 20px; }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: minmax(0,1.35fr) minmax(300px,.65fr);
+      gap: 14px; align-items: start;
+    }
+    .section {
+      border: 1px solid var(--line); border-radius: var(--r);
+      background: var(--surface); overflow: hidden; margin-bottom: 14px;
+    }
+    .section-header {
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-soft);
+      display: flex; justify-content: space-between; gap: 10px; align-items: center;
+      cursor: pointer; user-select: none;
+      transition: background var(--tr);
+    }
+    .section-header:hover { background: var(--accent-soft); }
+    .section-header h2 {
+      margin: 0; font-size: 11px; line-height: 1.2;
+      text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    }
+    .section-hdr-right { display: flex; align-items: center; gap: 8px; }
+    .count { color: var(--muted); font-size: 12px; }
+    .chevron { color: var(--muted); font-size: 10px; transition: transform var(--tr); display: inline-block; }
+    .section.collapsed .chevron { transform: rotate(-90deg); }
+    .section.collapsed .rows { display: none; }
+    .section.collapsed { border-bottom: none; }
+    .rows { display: flex; flex-direction: column; }
+    .row { padding: 10px 12px; border-bottom: 1px solid var(--line); transition: background var(--tr); }
+    .row:last-child { border-bottom: 0; }
+    .row:hover { background: var(--surface-soft); }
+    .row-head {
+      display: flex; gap: 8px; align-items: center;
+      color: var(--muted); font-size: 11.5px; margin-bottom: 6px;
+    }
+    .row-kind { font-family: var(--mono); color: var(--ink); font-weight: 650; font-size: 12px; }
+    .row-time { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .row-text { margin: 0; white-space: pre-wrap; line-height: 1.5; overflow-wrap: anywhere; font-size: 13px; }
+    .row-text.mono { font-family: var(--mono); font-size: 12px; }
+    .empty { padding: 28px 12px; color: var(--muted); text-align: center; font-size: 13px; }
+    @media (max-width: 1100px) {
+      .app { grid-template-columns: 320px minmax(0,1fr); }
+      .summary-strip { grid-template-columns: repeat(3,minmax(0,1fr)); }
+      .detail-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 820px) {
+      .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+      .sidebar { min-height: 46vh; border-right: 0; border-bottom: 1px solid var(--line); }
+      .content { min-height: 54vh; }
+      .topbar { grid-template-columns: 1fr; }
+      .segmented { width: 100%; }
+      .segmented button { flex: 1; min-width: 0; }
+      .summary-strip { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-text">
+          <h1>$encodedTitle</h1>
+          <div class="generated" id="generatedAt"></div>
+        </div>
+        <button class="theme-btn" id="themeBtn" title="Toggle color theme" aria-label="Toggle color theme">Dark</button>
+      </div>
+      <div class="metrics">
+        <div class="metric" id="mTotal" title="Show all tasks"><span>Tasks</span><strong id="metricTasks"></strong></div>
+        <div class="metric m-active" id="mActive" title="Filter active tasks"><span>Active</span><strong id="metricActive"></strong></div>
+        <div class="metric m-failed" id="mFailed" title="Filter failed tasks"><span>Failed</span><strong id="metricFailed"></strong></div>
+        <div class="metric m-attn" id="mAttn" title="Filter tasks needing attention"><span>Attn</span><strong id="metricAttention"></strong></div>
+      </div>
+      <div class="filters">
+        <div class="nlp-row">
+          <input id="nlpBox" type="text" placeholder="Natural language filter&hellip;" />
+          <button id="nlpRun" type="button">Ask</button>
+        </div>
+        <div class="search-row">
+          <input id="searchBox" type="search" placeholder="Search tasks and output&hellip;" />
+        </div>
+        <select id="statusFilter"></select>
+        <select id="projectFilter"></select>
+      </div>
+      <div class="task-list" id="taskList" role="listbox" aria-label="Task list"></div>
+    </aside>
+    <main class="content">
+      <div class="topbar">
+        <div>
+          <h2 class="selected-title" id="selectedTitle"></h2>
+          <div class="selected-subtitle" id="selectedSubtitle"></div>
+        </div>
+        <div class="segmented" role="group" aria-label="Detail view">
+          <button type="button" data-view="focused" class="active">Focused</button>
+          <button type="button" data-view="verbose">Verbose</button>
+        </div>
+      </div>
+      <div class="summary-strip">
+        <div class="summary-cell"><span>Status</span><strong id="summaryStatus"></strong></div>
+        <div class="summary-cell"><span>Events</span><strong id="summaryEvents"></strong></div>
+        <div class="summary-cell"><span>Artifacts</span><strong id="summaryArtifacts"></strong></div>
+        <div class="summary-cell"><span>Approvals</span><strong id="summaryApprovals"></strong></div>
+        <div class="summary-cell"><span>Session</span><strong id="summarySession"></strong></div>
+      </div>
+      <div class="view" id="detailView"></div>
+    </main>
+  </div>
+  <script id="dashboard-data" type="application/json">$json</script>
+  <script>
+    const data = JSON.parse(document.getElementById('dashboard-data').textContent);
+    const state = { selectedId: null, search: '', status: 'all', project: 'all', view: 'focused', attentionOnly: false, topic: 'all' };
+
+    const taskList = document.getElementById('taskList');
+    const detailView = document.getElementById('detailView');
+    const searchBox = document.getElementById('searchBox');
+    const nlpBox = document.getElementById('nlpBox');
+    const nlpRun = document.getElementById('nlpRun');
+    const statusFilter = document.getElementById('statusFilter');
+    const projectFilter = document.getElementById('projectFilter');
+    const themeBtn = document.getElementById('themeBtn');
+
+    // Theme toggle (persisted in localStorage)
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      themeBtn.textContent = theme === 'dark' ? 'Light' : 'Dark';
+      try { localStorage.setItem('cdx-theme', theme); } catch(_) {}
+    }
+    const savedTheme = (() => { try { return localStorage.getItem('cdx-theme'); } catch(_) { return null; } })();
+    applyTheme(savedTheme === 'dark' ? 'dark' : 'light');
+    themeBtn.addEventListener('click', () => {
+      applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+    });
+
+    document.getElementById('generatedAt').textContent = 'Generated ' + new Date(data.generatedAt).toLocaleString();
+    document.getElementById('metricTasks').textContent = String(data.taskCount);
+    document.getElementById('metricActive').textContent = String(data.activeCount);
+    document.getElementById('metricFailed').textContent = String(data.failedCount);
+    document.getElementById('metricAttention').textContent = String(data.attentionCount);
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+    }
+    function compact(value, fallback = '') {
+      const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+      return text || fallback;
+    }
+    function timeAgo(isoString) {
+      if (!isoString) { return ''; }
+      const diff = Date.now() - new Date(isoString).getTime();
+      if (isNaN(diff) || diff < 0) { return ''; }
+      if (diff < 60000) { return 'just now'; }
+      if (diff < 3600000) { return Math.floor(diff / 60000) + 'm ago'; }
+      if (diff < 86400000) { return Math.floor(diff / 3600000) + 'h ago'; }
+      return Math.floor(diff / 86400000) + 'd ago';
+    }
+    function fillSelect(select, values, allLabel) {
+      select.innerHTML = '';
+      const all = document.createElement('option');
+      all.value = 'all'; all.textContent = allLabel;
+      select.appendChild(all);
+      values.forEach((value) => {
+        const option = document.createElement('option');
+        option.value = value; option.textContent = value;
+        select.appendChild(option);
+      });
+    }
+    function statusClass(status) {
+      const n = compact(status, 'active').toLowerCase();
+      if (['failed','error','canceled'].includes(n)) { return n; }
+      if (['completed','active','starting','running','archived'].includes(n)) { return n; }
+      return 'active';
+    }
+    function pillHtml(status, showAttn) {
+      const cls = statusClass(status);
+      const label = escapeHtml(compact(status, 'active'));
+      const attnPill = showAttn ? ' <span class="pill attention"><span class="pill-dot"></span>attn</span>' : '';
+      return '<span class="pill ' + cls + '"><span class="pill-dot"></span>' + label + '</span>' + attnPill;
+    }
+
+    function filteredTasks() {
+      const search = state.search.toLowerCase().trim();
+      return data.tasks.filter((task) => {
+        if (state.status !== 'all' && task.status !== state.status) { return false; }
+        if (state.project !== 'all' && task.project !== state.project) { return false; }
+        if (state.attentionOnly && !(task.approvalCount > 0 || compact(task.lastErrorMessage))) { return false; }
+        if (search) {
+          const haystack = [task.name, task.project, task.status, task.shortId, task.path,
+            task.latest?.summary, task.latest?.text, task.lastErrorMessage].join(' ').toLowerCase();
+          if (!haystack.includes(search)) { return false; }
+        }
+        return true;
+      });
+    }
+    function selectedTask() {
+      const visible = filteredTasks();
+      if (!visible.length) { return null; }
+      if (!state.selectedId || !visible.some((t) => t.id === state.selectedId)) {
+        state.selectedId = visible[0].id;
+      }
+      return visible.find((t) => t.id === state.selectedId) || visible[0];
+    }
+    function chooseProject(text) {
+      const needle = text.toLowerCase().trim();
+      if (!needle) { return false; }
+      const match = data.projects.find((p) => p.toLowerCase() === needle)
+        || data.projects.find((p) => p.toLowerCase().includes(needle));
+      if (!match) { return false; }
+      state.project = match; return true;
+    }
+    function chooseTask(text) {
+      const needle = text.toLowerCase().trim();
+      if (!needle) { return false; }
+      const task = data.tasks.find((c) =>
+        [c.id, c.shortId, c.name, c.project].filter(Boolean)
+          .some((v) => String(v).toLowerCase().includes(needle))
+      );
+      if (!task) { return false; }
+      state.selectedId = task.id; return true;
+    }
+    function syncControls() {
+      searchBox.value = state.search;
+      statusFilter.value = state.status;
+      projectFilter.value = state.project;
+      document.querySelectorAll('.segmented button').forEach((b) => {
+        b.classList.toggle('active', b.dataset.view === state.view);
+      });
+    }
+    function resetNaturalFilters() {
+      state.search = ''; state.status = 'all'; state.project = 'all';
+      state.attentionOnly = false; state.topic = 'all'; state.view = 'focused';
+    }
+    function applyNaturalCommand(rawText) {
+      const command = compact(rawText).toLowerCase();
+      if (!command) { return; }
+      if (/^(all|clear|reset|show all|all tasks|show everything)$/.test(command)) {
+        resetNaturalFilters(); syncControls(); renderDetail(); return;
+      }
+      let consumed = false;
+      for (const term of ['failed','error','canceled','completed','active','starting','running','archived']) {
+        if (new RegExp('\\b' + term + '\\b').test(command) && data.statuses.includes(term)) {
+          state.status = term; consumed = true; break;
+        }
+      }
+      if (/\b(attention|stuck|blocked|approval|approvals|needs)\b/.test(command)) {
+        state.attentionOnly = true;
+        const t = data.tasks.find((c) => c.approvalCount > 0 || compact(c.lastErrorMessage));
+        if (t) { state.selectedId = t.id; }
+        consumed = true;
+      }
+      if (/\b(verbose|everything|all events|all output)\b/.test(command)) { state.view = 'verbose'; consumed = true; }
+      if (/\b(focused|focus|summary)\b/.test(command)) { state.view = 'focused'; consumed = true; }
+      const projectMatch = command.match(/\b(project|repo|repository)\s+(.+)$/);
+      if (projectMatch && chooseProject(projectMatch[2])) { consumed = true; }
+      const taskMatch = command.match(/\b(task|session|thread)\s+(.+)$/);
+      if (taskMatch && chooseTask(taskMatch[2])) { consumed = true; }
+      if (/\bartifacts?\b/.test(command)) {
+        const t = data.tasks.find((c) => c.artifactCount > 0);
+        if (t) { state.selectedId = t.id; }
+        state.topic = 'artifacts'; consumed = true;
+      }
+      if (/\bevents?\b/.test(command)) {
+        const t = data.tasks.find((c) => c.eventCount > 0);
+        if (t) { state.selectedId = t.id; }
+        state.topic = 'events'; consumed = true;
+      }
+      if (/\btranscript|output|reply\b/.test(command)) { state.topic = 'transcript'; consumed = true; }
+      if (!consumed) { state.search = command; }
+      syncControls(); renderDetail();
+    }
+
+    function renderTaskList() {
+      const visible = filteredTasks();
+      if (!visible.length) {
+        taskList.innerHTML = '<div class="empty">No tasks match the current filters.</div>';
+        return;
+      }
+      taskList.innerHTML = visible.map((task, idx) => {
+        const title = compact(task.name, task.shortId || task.id);
+        const status = compact(task.status, 'active');
+        const latest = compact(task.latest?.summary || task.latest?.text, 'Waiting for output…');
+        const attention = task.approvalCount > 0 || compact(task.lastErrorMessage);
+        const ago = timeAgo(task.timestamp);
+        const metaParts = [task.project, ago, task.shortId].filter(Boolean);
+        const meta = metaParts.map(escapeHtml).join('<span class="task-meta-sep"> | </span>');
+        const isSelected = task.id === state.selectedId;
+        return [
+          '<button class="task-card' + (isSelected ? ' selected' : '') + '"',
+          ' data-id="' + escapeHtml(task.id) + '"',
+          ' role="option" aria-selected="' + isSelected + '"',
+          ' tabindex="' + (idx === 0 || isSelected ? '0' : '-1') + '">',
+          '<div class="task-title-row">',
+          '<span class="task-title">' + escapeHtml(title) + '</span>',
+          pillHtml(status, attention),
+          '</div>',
+          meta ? '<div class="task-meta">' + meta + '</div>' : '',
+          '<div class="preview">' + escapeHtml(latest) + '</div>',
+          '</button>'
+        ].join('');
+      }).join('');
+    }
+
+    function rowHtml(kind, when, text, options = {}) {
+      const meta = [options.phase, options.name].filter(Boolean).map(escapeHtml).join(' · ');
+      const ago = timeAgo(when);
+      return [
+        '<div class="row">',
+        '<div class="row-head">',
+        '<span class="row-kind">' + escapeHtml(kind) + '</span>',
+        meta ? '<span>' + meta + '</span>' : '',
+        ago ? '<span class="row-time">' + escapeHtml(ago) + '</span>' : '',
+        '</div>',
+        '<pre class="row-text' + (options.mono ? ' mono' : '') + '">' + escapeHtml(text) + '</pre>',
+        '</div>'
+      ].join('');
+    }
+    function sectionHtml(title, countLabel, body) {
+      return [
+        '<section class="section">',
+        '<div class="section-header">',
+        '<h2>' + escapeHtml(title) + '</h2>',
+        '<div class="section-hdr-right">',
+        '<span class="count">' + escapeHtml(countLabel) + '</span>',
+        '<span class="chevron">&#9660;</span>',
+        '</div></div>',
+        '<div class="rows">' + body + '</div>',
+        '</section>'
+      ].join('');
+    }
+
+    function renderDetail() {
+      const task = selectedTask();
+      renderTaskList();
+      if (!task) {
+        document.getElementById('selectedTitle').textContent = 'No tasks';
+        document.getElementById('selectedSubtitle').innerHTML = '';
+        detailView.innerHTML = '<div class="empty">No tasks match the current filters.</div>';
+        return;
+      }
+
+      document.getElementById('selectedTitle').textContent = compact(task.name, task.shortId || task.id);
+      const subtitleParts = [task.project, task.path, task.branch].filter(Boolean).map(escapeHtml).join(' · ');
+      const copyBtn = '<button class="copy-id-btn" id="copyIdBtn">' + escapeHtml(task.shortId || task.id) + '</button>';
+      document.getElementById('selectedSubtitle').innerHTML = (subtitleParts ? subtitleParts + ' ' : '') + copyBtn;
+      document.getElementById('copyIdBtn').addEventListener('click', () => {
+        navigator.clipboard?.writeText(task.id).then(() => {
+          const btn = document.getElementById('copyIdBtn');
+          if (btn) { const orig = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = orig; }, 1200); }
+        });
+      });
+
+      document.getElementById('summaryStatus').innerHTML = pillHtml(task.status, false);
+      document.getElementById('summaryEvents').textContent = String(task.eventCount || 0);
+      document.getElementById('summaryArtifacts').textContent = String(task.artifactCount || 0);
+      document.getElementById('summaryApprovals').textContent = String(task.approvalCount || 0);
+      document.getElementById('summarySession').textContent = compact(task.sessionPath ? task.sessionPath.split(/[\\/]/).pop() : '', 'none');
+
+      const transcriptItems = (task.transcript || []).filter((item) => {
+        if (state.view === 'verbose') { return true; }
+        const phase = compact(item.phase).toLowerCase();
+        const role = compact(item.role).toLowerCase();
+        return role !== 'user' && !['reasoning','tool','command'].includes(phase);
+      });
+      const transcriptBody = transcriptItems.length
+        ? transcriptItems.map((item) => rowHtml(item.role || item.itemType || 'item', item.when || item.timestamp, item.text, { phase: item.phase })).join('')
+        : '<div class="empty">No transcript items in this view.</div>';
+
+      const eventItems = state.view === 'verbose'
+        ? (task.events || [])
+        : (task.events || []).filter((item) => !['Reasoning','ToolResult'].includes(item.kind));
+      const eventBody = eventItems.length
+        ? eventItems.map((item) => rowHtml(item.kind || 'Event', item.when || item.timestamp, item.summary || item.text || item.type, { name: item.name, phase: item.phase, mono: item.kind === 'Command' })).join('')
+        : '<div class="empty">No events in this view.</div>';
+
+      const artifactBody = (task.artifacts || []).length
+        ? task.artifacts.map((item) => rowHtml(item.kind || 'Artifact', item.when || item.timestamp, item.summary || item.name, { name: item.name })).join('')
+        : '<div class="empty">No artifacts discovered.</div>';
+
+      const approvalBody = (task.approvals || []).length
+        ? task.approvals.map((item) => rowHtml(item.approvalType || 'Approval', item.when, item.target || item.summary || item.status, { name: item.status })).join('')
+        : '<div class="empty">No observed approvals.</div>';
+
+      const latestBody = task.latest?.text
+        ? rowHtml(task.latest.status || 'latest', task.latest.when || task.latest.timestamp, task.latest.text)
+        : '<div class="empty">No latest output.</div>';
+
+      const sections = {
+        output: sectionHtml('Latest Output', task.latest?.status || '', latestBody),
+        transcript: sectionHtml('Transcript', transcriptItems.length + ' visible', transcriptBody),
+        events: sectionHtml('Events', eventItems.length + ' visible', eventBody),
+        artifacts: sectionHtml('Artifacts', (task.artifacts || []).length + ' items', artifactBody),
+        approvals: sectionHtml('Approvals', (task.approvals || []).length + ' items', approvalBody)
+      };
+
+      const left = state.topic === 'events' || state.topic === 'artifacts'
+        ? [sections[state.topic], sections.output, sections.transcript].join('')
+        : [sections.output, sections.transcript].join('');
+      const right = state.topic === 'events' || state.topic === 'artifacts'
+        ? [sections.approvals].join('')
+        : [sections.events, sections.artifacts, sections.approvals].join('');
+
+      detailView.innerHTML = '<div class="detail-grid"><div>' + left + '</div><div>' + right + '</div></div>';
+
+      // Collapsible sections
+      detailView.querySelectorAll('.section-header').forEach((header) => {
+        header.addEventListener('click', () => header.closest('.section').classList.toggle('collapsed'));
+      });
+    }
+
+    fillSelect(statusFilter, data.statuses, 'All statuses');
+    fillSelect(projectFilter, data.projects, 'All projects');
+    renderDetail();
+
+    taskList.addEventListener('click', (event) => {
+      const card = event.target.closest('.task-card');
+      if (!card) { return; }
+      state.selectedId = card.dataset.id;
+      renderDetail();
+    });
+
+    // Arrow-key navigation in the task list
+    taskList.addEventListener('keydown', (event) => {
+      if (!['ArrowDown','ArrowUp','Enter',' '].includes(event.key)) { return; }
+      event.preventDefault();
+      const cards = Array.from(taskList.querySelectorAll('.task-card'));
+      if (!cards.length) { return; }
+      const curIdx = cards.findIndex((c) => c.dataset.id === state.selectedId);
+      if (event.key === 'ArrowDown') {
+        const next = cards[Math.min(curIdx + 1, cards.length - 1)];
+        state.selectedId = next.dataset.id; renderDetail(); next.focus();
+      } else if (event.key === 'ArrowUp') {
+        const prev = cards[Math.max(curIdx - 1, 0)];
+        state.selectedId = prev.dataset.id; renderDetail(); prev.focus();
+      } else {
+        const focused = document.activeElement?.closest('.task-card');
+        if (focused) { state.selectedId = focused.dataset.id; renderDetail(); }
+      }
+    });
+
+    searchBox.addEventListener('input', (event) => {
+      state.search = event.target.value; state.attentionOnly = false; renderDetail();
+    });
+    nlpRun.addEventListener('click', () => applyNaturalCommand(nlpBox.value));
+    nlpBox.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); applyNaturalCommand(nlpBox.value); }
+    });
+    statusFilter.addEventListener('change', (event) => {
+      state.status = event.target.value; state.attentionOnly = false; renderDetail();
+    });
+    projectFilter.addEventListener('change', (event) => {
+      state.project = event.target.value; state.attentionOnly = false; renderDetail();
+    });
+
+    // Metric tiles as filter shortcuts
+    document.getElementById('mTotal').addEventListener('click', () => { resetNaturalFilters(); syncControls(); renderDetail(); });
+    document.getElementById('mActive').addEventListener('click', () => {
+      state.status = state.status === 'active' ? 'all' : 'active'; syncControls(); renderDetail();
+    });
+    document.getElementById('mFailed').addEventListener('click', () => {
+      state.status = state.status === 'failed' ? 'all' : 'failed'; syncControls(); renderDetail();
+    });
+    document.getElementById('mAttn').addEventListener('click', () => {
+      state.attentionOnly = !state.attentionOnly; syncControls(); renderDetail();
+    });
+
+    document.querySelectorAll('.segmented button').forEach((button) => {
+      button.addEventListener('click', () => {
+        state.view = button.dataset.view;
+        document.querySelectorAll('.segmented button').forEach((b) => {
+          b.classList.toggle('active', b.dataset.view === state.view);
+        });
+        renderDetail();
+      });
+    });
+    </script>
+</body>
+</html>
+"@
+}
+
+function ConvertTo-CodexTaskDashboardData {
+    <#
+    .SYNOPSIS
+        Converts Codex tasks into the dashboard data contract.
+    .DESCRIPTION
+        ConvertTo-CodexTaskDashboardData returns the JSON-ready object consumed
+        by Show-CodexTaskDashboard. Use this when a separate frontend should own
+        the UI while PSUnplugged owns task/session state collection.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [string]$Title,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 25,
+        [int]$TranscriptLimit = 80,
+        [int]$EventLimit = 120,
+        [int]$ArtifactLimit = 40,
+        [PSCustomObject]$Session
+    )
+
+    begin {
+        $inputs = [System.Collections.Generic.List[object]]::new()
+        $ids = [System.Collections.Generic.List[string]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            $inputs.Add($InputObject)
+            return
+        }
+
+        foreach ($threadId in @($Id)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$threadId)) {
+                $ids.Add([string]$threadId)
+            }
+        }
+    }
+
+    end {
+        $taskLookup = [ordered]@{}
+
+        foreach ($taskId in @($ids | Select-Object -Unique)) {
+            $resolvedId = Resolve-CodexTaskIdentifierText -Id $taskId
+            if ([string]::IsNullOrWhiteSpace($resolvedId)) {
+                continue
+            }
+
+            $task = Get-CodexTask -Id $resolvedId -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+            Select-Object -First 1
+            if (-not $task) {
+                $task = [PSCustomObject]@{
+                    TaskId   = $resolvedId
+                    ThreadId = $resolvedId
+                    Status   = 'active'
+                }
+            }
+
+            $taskLookup[$resolvedId] = $task
+        }
+
+        foreach ($item in @($inputs)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $item
+            if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                $taskLookup[$taskId] = $item
+            }
+        }
+
+        if ($taskLookup.Count -eq 0) {
+            $effectiveProject = if ([string]::IsNullOrWhiteSpace($Project)) { (Get-Location).Path } else { $Project }
+            foreach ($task in @(Get-CodexTask -Project $effectiveProject -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit $Limit -Session $Session -SpinnerStatus $null)) {
+                $taskId = Resolve-CodexTaskIdentifier -InputObject $task
+                if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                    $taskLookup[$taskId] = $task
+                }
+            }
+        }
+
+        $dashboardTasks = [System.Collections.Generic.List[object]]::new()
+        foreach ($taskEntry in @($taskLookup.Values)) {
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $taskEntry
+            if ([string]::IsNullOrWhiteSpace($taskId)) {
+                continue
+            }
+
+            $task = if ($taskEntry.PSObject.TypeNames -contains 'PSUnplugged.CodexTask') {
+                $taskEntry
+            }
+            else {
+                Get-CodexTask -Id $taskId -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+                Select-Object -First 1
+            }
+            if (-not $task) {
+                $task = $taskEntry
+            }
+
+            $receiveParams = @{ Limit = 25 }
+            if ($IncludeArchived) { $receiveParams.IncludeArchived = $true }
+            if ($LocalOnly) { $receiveParams.LocalOnly = $true }
+            if ($Session) { $receiveParams.Session = $Session }
+            $latestOutput = @($task | Receive-CodexTask @receiveParams) | Select-Object -First 1
+
+            $transcriptParams = @{
+                Id               = $taskId
+                IncludeTelemetry = $true
+                TelemetryType    = @('all')
+                SpinnerStatus    = $null
+            }
+            if ($IncludeArchived) { $transcriptParams.IncludeArchived = $true }
+            if ($LocalOnly) { $transcriptParams.LocalOnly = $true }
+            if ($Session) { $transcriptParams.Session = $Session }
+            $transcript = @(
+                Get-CodexTranscript @transcriptParams |
+                Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } }
+            )
+            if ($TranscriptLimit -gt 0 -and $transcript.Count -gt $TranscriptLimit) {
+                $transcript = @($transcript | Select-Object -Last $TranscriptLimit)
+            }
+
+            $eventParams = @{
+                Id            = $taskId
+                Limit         = $EventLimit
+                SpinnerStatus = $null
+            }
+            if ($IncludeArchived) { $eventParams.IncludeArchived = $true }
+            if ($LocalOnly) { $eventParams.LocalOnly = $true }
+            if ($Session) { $eventParams.Session = $Session }
+            $events = @(Get-CodexEvent @eventParams)
+
+            $artifactParams = @{
+                Id            = $taskId
+                Limit         = $ArtifactLimit
+                SpinnerStatus = $null
+            }
+            if ($IncludeArchived) { $artifactParams.IncludeArchived = $true }
+            if ($LocalOnly) { $artifactParams.LocalOnly = $true }
+            if ($Session) { $artifactParams.Session = $Session }
+            $artifacts = @(Get-CodexArtifact @artifactParams)
+
+            $approvalParams = @{
+                Id            = $taskId
+                Limit         = 40
+                SpinnerStatus = $null
+            }
+            if ($IncludeArchived) { $approvalParams.IncludeArchived = $true }
+            if ($LocalOnly) { $approvalParams.LocalOnly = $true }
+            if ($Session) { $approvalParams.Session = $Session }
+            $approvals = @(Get-CodexApproval @approvalParams)
+
+            $sessionPath = Resolve-CodexTaskSessionPath -InputObject $task
+            $latestText = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Text', 'text'))
+            $latestSummary = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Summary', 'summary'))
+            if ([string]::IsNullOrWhiteSpace($latestSummary)) {
+                $latestSummary = if (-not [string]::IsNullOrWhiteSpace($latestText)) {
+                    Get-CodexTaskReceiveSummary -Text $latestText
+                }
+                else {
+                    [string](Get-CodexFirstValue -InputObject $task -PropertyName @('LastErrorMessage', 'lastErrorMessage'))
+                }
+            }
+
+            $status = Get-CodexTaskEffectiveStatus -InputObject $task
+            $eventKindCounts = @{}
+            foreach ($group in @($events | Group-Object Kind)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$group.Name)) {
+                    $eventKindCounts[[string]$group.Name] = $group.Count
+                }
+            }
+
+            $artifactKindCounts = @{}
+            foreach ($group in @($artifacts | Group-Object Kind)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$group.Name)) {
+                    $artifactKindCounts[[string]$group.Name] = $group.Count
+                }
+            }
+
+            $dashboardTasks.Add([PSCustomObject]@{
+                    id               = $taskId
+                    shortId          = Get-CodexCompactId -Id $taskId
+                    name             = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Name', 'name', 'ThreadName', 'threadName'))
+                    project          = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Project', 'project', 'ProjectName', 'projectName'))
+                    path             = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Path', 'path', 'ProjectPath', 'projectPath'))
+                    status           = if ([string]::IsNullOrWhiteSpace($status)) { 'active' } else { $status }
+                    when             = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('When', 'when'))
+                    timestamp        = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('LastActivityAt', 'lastActivityAt', 'Timestamp', 'timestamp'))
+                    branch           = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Branch', 'branch', 'GitBranch', 'gitBranch'))
+                    model            = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Model', 'model'))
+                    source           = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Source', 'source'))
+                    workerProcessId  = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('WorkerProcessId', 'workerProcessId'))
+                    lastErrorMessage = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('LastErrorMessage', 'lastErrorMessage'))
+                    sessionPath      = $sessionPath
+                    latest           = [PSCustomObject]@{
+                        status    = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Status', 'status'))
+                        phase     = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Phase', 'phase'))
+                        when      = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('When', 'when'))
+                        timestamp = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Timestamp', 'timestamp'))
+                        summary   = $latestSummary
+                        text      = $latestText
+                    }
+                    eventCount       = $events.Count
+                    eventKindCounts  = $eventKindCounts
+                    artifactCount    = $artifacts.Count
+                    artifactKinds    = $artifactKindCounts
+                    approvalCount    = $approvals.Count
+                    transcript       = @(
+                        foreach ($item in $transcript) {
+                            [PSCustomObject]@{
+                                role      = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Role', 'role'))
+                                itemType  = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('ItemType', 'itemType'))
+                                phase     = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Phase', 'phase'))
+                                when      = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('When', 'when'))
+                                timestamp = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Timestamp', 'timestamp'))
+                                text      = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Text', 'text'))
+                            }
+                        }
+                    )
+                    events           = @(
+                        foreach ($event in $events) {
+                            [PSCustomObject]@{
+                                kind      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Kind', 'kind'))
+                                type      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Type', 'type'))
+                                name      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Name', 'name'))
+                                phase     = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Phase', 'phase'))
+                                when      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('When', 'when'))
+                                timestamp = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Timestamp', 'timestamp'))
+                                summary   = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Summary', 'summary'))
+                                text      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Text', 'text'))
+                            }
+                        }
+                    )
+                    artifacts        = @(
+                        foreach ($artifact in $artifacts) {
+                            [PSCustomObject]@{
+                                kind      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Kind', 'kind'))
+                                name      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Name', 'name'))
+                                path      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Path', 'path'))
+                                when      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('When', 'when'))
+                                timestamp = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Timestamp', 'timestamp'))
+                                summary   = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Summary', 'summary'))
+                                size      = Get-CodexFirstValue -InputObject $artifact -PropertyName @('Size', 'size')
+                                itemCount = Get-CodexFirstValue -InputObject $artifact -PropertyName @('ItemCount', 'itemCount')
+                            }
+                        }
+                    )
+                    approvals        = @(
+                        foreach ($approval in $approvals) {
+                            [PSCustomObject]@{
+                                status       = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('Status', 'status'))
+                                approvalType = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('ApprovalType', 'approvalType'))
+                                target       = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('Target', 'target'))
+                                when         = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('When', 'when'))
+                                summary      = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('Summary', 'summary'))
+                            }
+                        }
+                    )
+                })
+        }
+
+        $tasks = @(
+            $dashboardTasks |
+            Sort-Object -Property @{ Expression = { $_.timestamp }; Descending = $true }, @{ Expression = { $_.name } }
+        )
+
+        return (New-CodexTaskDashboardData -Task $tasks -Title $Title)
+    }
+}
+
+function Show-CodexTaskDashboard {
+    <#
+    .SYNOPSIS
+        Builds a local dashboard snapshot for one or more Codex tasks.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName = $true)][Alias('TaskId', 'ThreadId')][string[]]$Id,
+        [Parameter(Position = 0)][string]$Project,
+        [Parameter(ValueFromPipeline = $true, DontShow = $true)]$InputObject,
+        [string]$OutputPath,
+        [string]$Title,
+        [switch]$NoOpen,
+        [switch]$PassThru,
+        [switch]$IncludeArchived,
+        [switch]$LocalOnly,
+        [int]$Limit = 25,
+        [int]$TranscriptLimit = 80,
+        [int]$EventLimit = 120,
+        [int]$ArtifactLimit = 40,
+        [PSCustomObject]$Session
+    )
+
+    begin {
+        $inputs = [System.Collections.Generic.List[object]]::new()
+        $ids = [System.Collections.Generic.List[string]]::new()
+        $dashboardDataInputs = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process {
+        if ($null -ne $InputObject) {
+            if ($InputObject.PSObject.TypeNames -contains 'PSUnplugged.CodexTaskDashboardData') {
+                $dashboardDataInputs.Add($InputObject)
+                return
+            }
+
+            $inputs.Add($InputObject)
+            return
+        }
+
+        foreach ($threadId in @($Id)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$threadId)) {
+                $ids.Add([string]$threadId)
+            }
+        }
+    }
+
+    end {
+        if ($dashboardDataInputs.Count -gt 0) {
+            $dashboardData = $dashboardDataInputs[0]
+            $dashboardTasks = @($dashboardData.tasks | Where-Object { $null -ne $_ })
+
+            if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+                $OutputPath = New-CodexTaskDashboardHtmlPath -Task $dashboardTasks -Title $Title
+            }
+            else {
+                $directory = Split-Path -Parent $OutputPath
+                if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+                    $null = New-Item -ItemType Directory -Path $directory -Force
+                }
+                $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+            }
+
+            $html = ConvertTo-CodexTaskDashboardHtml -Data $dashboardData -Title $Title
+            Set-Content -LiteralPath $OutputPath -Value $html -Encoding utf8
+
+            if (-not $NoOpen) {
+                Start-Process -FilePath $OutputPath
+            }
+
+            if ($PassThru -or $NoOpen) {
+                $page = [PSCustomObject]@{
+                    Path      = $OutputPath
+                    Title     = if ([string]::IsNullOrWhiteSpace($Title)) { [string](Get-CodexFirstValue -InputObject $dashboardData -PropertyName @('title', 'Title')) } else { $Title }
+                    TaskCount = $dashboardTasks.Count
+                    Opened    = (-not $NoOpen)
+                }
+                $page.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTaskDashboardPage')
+                return $page
+            }
+
+            return
+        }
+
+        $taskLookup = [ordered]@{}
+
+        foreach ($taskId in @($ids | Select-Object -Unique)) {
+            $resolvedId = Resolve-CodexTaskIdentifierText -Id $taskId
+            if ([string]::IsNullOrWhiteSpace($resolvedId)) {
+                continue
+            }
+
+            $task = Get-CodexTask -Id $resolvedId -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+            Select-Object -First 1
+            if (-not $task) {
+                $task = [PSCustomObject]@{
+                    TaskId   = $resolvedId
+                    ThreadId = $resolvedId
+                    Status   = 'active'
+                }
+            }
+
+            $taskLookup[$resolvedId] = $task
+        }
+
+        foreach ($item in @($inputs)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $item
+            if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                $taskLookup[$taskId] = $item
+            }
+        }
+
+        if ($taskLookup.Count -eq 0) {
+            $effectiveProject = if ([string]::IsNullOrWhiteSpace($Project)) { (Get-Location).Path } else { $Project }
+            foreach ($task in @(Get-CodexTask -Project $effectiveProject -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit $Limit -Session $Session -SpinnerStatus $null)) {
+                $taskId = Resolve-CodexTaskIdentifier -InputObject $task
+                if (-not [string]::IsNullOrWhiteSpace($taskId)) {
+                    $taskLookup[$taskId] = $task
+                }
+            }
+        }
+
+        $dashboardTasks = [System.Collections.Generic.List[object]]::new()
+        foreach ($taskEntry in @($taskLookup.Values)) {
+            $taskId = Resolve-CodexTaskIdentifier -InputObject $taskEntry
+            if ([string]::IsNullOrWhiteSpace($taskId)) {
+                continue
+            }
+
+            $task = if ($taskEntry.PSObject.TypeNames -contains 'PSUnplugged.CodexTask') {
+                $taskEntry
+            }
+            else {
+                Get-CodexTask -Id $taskId -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+                Select-Object -First 1
+            }
+            if (-not $task) {
+                $task = $taskEntry
+            }
+
+            $receiveParams = @{ Limit = 25 }
+            if ($IncludeArchived) { $receiveParams.IncludeArchived = $true }
+            if ($LocalOnly) { $receiveParams.LocalOnly = $true }
+            if ($Session) { $receiveParams.Session = $Session }
+            $latestOutput = @($task | Receive-CodexTask @receiveParams) | Select-Object -First 1
+
+            $transcriptParams = @{
+                Id               = $taskId
+                IncludeTelemetry = $true
+                TelemetryType    = @('all')
+                SpinnerStatus    = $null
+            }
+            if ($IncludeArchived) { $transcriptParams.IncludeArchived = $true }
+            if ($LocalOnly) { $transcriptParams.LocalOnly = $true }
+            if ($Session) { $transcriptParams.Session = $Session }
+            $transcript = @(
+                Get-CodexTranscript @transcriptParams |
+                Sort-Object -Property @{ Expression = { $_.Timestamp } }, @{ Expression = { $_.Index } }
+            )
+            if ($TranscriptLimit -gt 0 -and $transcript.Count -gt $TranscriptLimit) {
+                $transcript = @($transcript | Select-Object -Last $TranscriptLimit)
+            }
+
+            $eventParams = @{
+                Id            = $taskId
+                Limit         = $EventLimit
+                SpinnerStatus = $null
+            }
+            if ($IncludeArchived) { $eventParams.IncludeArchived = $true }
+            if ($LocalOnly) { $eventParams.LocalOnly = $true }
+            if ($Session) { $eventParams.Session = $Session }
+            $events = @(Get-CodexEvent @eventParams)
+
+            $artifactParams = @{
+                Id            = $taskId
+                Limit         = $ArtifactLimit
+                SpinnerStatus = $null
+            }
+            if ($IncludeArchived) { $artifactParams.IncludeArchived = $true }
+            if ($LocalOnly) { $artifactParams.LocalOnly = $true }
+            if ($Session) { $artifactParams.Session = $Session }
+            $artifacts = @(Get-CodexArtifact @artifactParams)
+
+            $approvalParams = @{
+                Id            = $taskId
+                Limit         = 40
+                SpinnerStatus = $null
+            }
+            if ($IncludeArchived) { $approvalParams.IncludeArchived = $true }
+            if ($LocalOnly) { $approvalParams.LocalOnly = $true }
+            if ($Session) { $approvalParams.Session = $Session }
+            $approvals = @(Get-CodexApproval @approvalParams)
+
+            $sessionPath = Resolve-CodexTaskSessionPath -InputObject $task
+            $latestText = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Text', 'text'))
+            $latestSummary = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Summary', 'summary'))
+            if ([string]::IsNullOrWhiteSpace($latestSummary)) {
+                $latestSummary = if (-not [string]::IsNullOrWhiteSpace($latestText)) {
+                    Get-CodexTaskReceiveSummary -Text $latestText
+                }
+                else {
+                    [string](Get-CodexFirstValue -InputObject $task -PropertyName @('LastErrorMessage', 'lastErrorMessage'))
+                }
+            }
+
+            $status = Get-CodexTaskEffectiveStatus -InputObject $task
+            $eventKindCounts = @{}
+            foreach ($group in @($events | Group-Object Kind)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$group.Name)) {
+                    $eventKindCounts[[string]$group.Name] = $group.Count
+                }
+            }
+
+            $artifactKindCounts = @{}
+            foreach ($group in @($artifacts | Group-Object Kind)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$group.Name)) {
+                    $artifactKindCounts[[string]$group.Name] = $group.Count
+                }
+            }
+
+            $dashboardTasks.Add([PSCustomObject]@{
+                    id               = $taskId
+                    shortId          = Get-CodexCompactId -Id $taskId
+                    name             = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Name', 'name', 'ThreadName', 'threadName'))
+                    project          = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Project', 'project', 'ProjectName', 'projectName'))
+                    path             = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Path', 'path', 'ProjectPath', 'projectPath'))
+                    status           = if ([string]::IsNullOrWhiteSpace($status)) { 'active' } else { $status }
+                    when             = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('When', 'when'))
+                    timestamp        = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('LastActivityAt', 'lastActivityAt', 'Timestamp', 'timestamp'))
+                    branch           = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Branch', 'branch', 'GitBranch', 'gitBranch'))
+                    model            = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Model', 'model'))
+                    source           = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('Source', 'source'))
+                    workerProcessId  = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('WorkerProcessId', 'workerProcessId'))
+                    lastErrorMessage = [string](Get-CodexFirstValue -InputObject $task -PropertyName @('LastErrorMessage', 'lastErrorMessage'))
+                    sessionPath      = $sessionPath
+                    latest           = [PSCustomObject]@{
+                        status    = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Status', 'status'))
+                        phase     = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Phase', 'phase'))
+                        when      = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('When', 'when'))
+                        timestamp = [string](Get-CodexFirstValue -InputObject $latestOutput -PropertyName @('Timestamp', 'timestamp'))
+                        summary   = $latestSummary
+                        text      = $latestText
+                    }
+                    eventCount       = $events.Count
+                    eventKindCounts  = $eventKindCounts
+                    artifactCount    = $artifacts.Count
+                    artifactKinds    = $artifactKindCounts
+                    approvalCount    = $approvals.Count
+                    transcript       = @(
+                        foreach ($item in $transcript) {
+                            [PSCustomObject]@{
+                                role      = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Role', 'role'))
+                                itemType  = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('ItemType', 'itemType'))
+                                phase     = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Phase', 'phase'))
+                                when      = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('When', 'when'))
+                                timestamp = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Timestamp', 'timestamp'))
+                                text      = [string](Get-CodexFirstValue -InputObject $item -PropertyName @('Text', 'text'))
+                            }
+                        }
+                    )
+                    events           = @(
+                        foreach ($event in $events) {
+                            [PSCustomObject]@{
+                                kind      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Kind', 'kind'))
+                                type      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Type', 'type'))
+                                name      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Name', 'name'))
+                                phase     = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Phase', 'phase'))
+                                when      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('When', 'when'))
+                                timestamp = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Timestamp', 'timestamp'))
+                                summary   = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Summary', 'summary'))
+                                text      = [string](Get-CodexFirstValue -InputObject $event -PropertyName @('Text', 'text'))
+                            }
+                        }
+                    )
+                    artifacts        = @(
+                        foreach ($artifact in $artifacts) {
+                            [PSCustomObject]@{
+                                kind      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Kind', 'kind'))
+                                name      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Name', 'name'))
+                                path      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Path', 'path'))
+                                when      = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('When', 'when'))
+                                timestamp = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Timestamp', 'timestamp'))
+                                summary   = [string](Get-CodexFirstValue -InputObject $artifact -PropertyName @('Summary', 'summary'))
+                                size      = Get-CodexFirstValue -InputObject $artifact -PropertyName @('Size', 'size')
+                                itemCount = Get-CodexFirstValue -InputObject $artifact -PropertyName @('ItemCount', 'itemCount')
+                            }
+                        }
+                    )
+                    approvals        = @(
+                        foreach ($approval in $approvals) {
+                            [PSCustomObject]@{
+                                status       = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('Status', 'status'))
+                                approvalType = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('ApprovalType', 'approvalType'))
+                                target       = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('Target', 'target'))
+                                when         = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('When', 'when'))
+                                summary      = [string](Get-CodexFirstValue -InputObject $approval -PropertyName @('Summary', 'summary'))
+                            }
+                        }
+                    )
+                })
+        }
+
+        $tasks = @(
+            $dashboardTasks |
+            Sort-Object -Property @{ Expression = { $_.timestamp }; Descending = $true }, @{ Expression = { $_.name } }
+        )
+
+        if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+            $OutputPath = New-CodexTaskDashboardHtmlPath -Task $tasks -Title $Title
+        }
+        else {
+            $directory = Split-Path -Parent $OutputPath
+            if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+                $null = New-Item -ItemType Directory -Path $directory -Force
+            }
+            $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+        }
+
+        $dashboardData = New-CodexTaskDashboardData -Task $tasks -Title $Title
+        $html = ConvertTo-CodexTaskDashboardHtml -Data $dashboardData -Title $Title
+        Set-Content -LiteralPath $OutputPath -Value $html -Encoding utf8
+
+        if (-not $NoOpen) {
+            Start-Process -FilePath $OutputPath
+        }
+
+        if ($PassThru -or $NoOpen) {
+            $page = [PSCustomObject]@{
+                Path      = $OutputPath
+                Title     = if ([string]::IsNullOrWhiteSpace($Title)) { $null } else { $Title }
+                TaskCount = $tasks.Count
+                Opened    = (-not $NoOpen)
+            }
+            $page.PSObject.TypeNames.Insert(0, 'PSUnplugged.CodexTaskDashboardPage')
             return $page
         }
     }
@@ -5739,12 +8404,16 @@ function Get-CodexTask {
     .SYNOPSIS
         Returns managed Codex tasks using task-first terminology.
     .DESCRIPTION
-        By default, returns tasks associated with the current working directory.
+        By default, returns an operator view across projects, similar to Get-Job:
+        tasks that are active or need attention, plus completed tasks from the
+        recent work window.
 
-        Pass -Project '*' to list tasks across all projects, and -IncludeArchived
-        when you want archived task records included.
+        Pass -Project to scope the view to a specific project or project path, and
+        -IncludeArchived when you want archived task records included.
 
-        Use -ActiveOnly to focus on tasks that are still in play.
+        Use -ActiveOnly to focus on tasks that are still in play, -RecentHours or
+        -Since to tune the completed-task window, -All to include older completed
+        tasks, and -LocalOnly when you want to skip the Codex app-server refresh.
     #>
     [CmdletBinding()]
     param(
@@ -5756,6 +8425,11 @@ function Get-CodexTask {
         [Parameter(ValueFromPipelineByPropertyName = $true, DontShow = $true)][Alias('Path')][string]$ProjectPathInput,
         [switch]$IncludeArchived,
         [switch]$ActiveOnly,
+        [switch]$All,
+        [switch]$Refresh,
+        [ValidateRange(0, 8760)]
+        [double]$RecentHours = 4,
+        [DateTimeOffset]$Since,
         [switch]$LocalOnly,
         [int]$Limit = 25,
         [PSCustomObject]$Session,
@@ -5769,7 +8443,7 @@ function Get-CodexTask {
 
         $threadParams = @{}
         foreach ($entry in $PSBoundParameters.GetEnumerator()) {
-            if ($entry.Key -in @('ActiveOnly', 'IncludeArchived')) {
+            if ($entry.Key -in @('ActiveOnly', 'All', 'Refresh', 'RecentHours', 'Since', 'IncludeArchived')) {
                 continue
             }
 
@@ -5796,20 +8470,20 @@ function Get-CodexTask {
             return ($InputObject | ConvertTo-CodexTaskOutput -Session $Session)
         }
 
-        $hasProjectFilter =
-        $PSBoundParameters.ContainsKey('Project') -or
-        $PSBoundParameters.ContainsKey('ProjectKey') -or
-        $PSBoundParameters.ContainsKey('ProjectName') -or
-        $PSBoundParameters.ContainsKey('ProjectPathInput')
-
-        if (
-            ($null -eq $InputObject) -and
-            (-not $threadParams.ContainsKey('Id')) -and
-            (-not $hasProjectFilter)
-        ) {
-            $threadParams.Project = (Get-Location).Path
+        if (-not $PSBoundParameters.ContainsKey('SpinnerStatus')) {
+            $SpinnerStatus = if ($LocalOnly) {
+                'Loading Codex tasks: reading local catalog and worker handles...'
+            }
+            else {
+                'Loading Codex tasks: reading catalog, refreshing app-server, preparing view...'
+            }
         }
 
+        $threadParams.SpinnerStatus = $null
+        $hasSince = $PSBoundParameters.ContainsKey('Since')
+        $hasLocalOnly = $PSBoundParameters.ContainsKey('LocalOnly')
+
+        return Invoke-PSUnpluggedWithSpinner -Status $SpinnerStatus -ScriptBlock {
         if ($PSBoundParameters.ContainsKey('IncludeArchived')) {
             if ($IncludeArchived) {
                 $threadParams.IncludeArchived = $true
@@ -5870,17 +8544,74 @@ function Get-CodexTask {
                 }
             )
         }
-        if ($ActiveOnly) {
-            $tasks = @(
-                $tasks | Where-Object {
-                    $status = ConvertTo-CodexTaskTerminalStatus -Status ([string](Get-CodexFirstValue -InputObject $_ -PropertyName @('Status', 'status')))
-                    -not ($status -in @('completed', 'failed', 'error', 'canceled', 'archived'))
+
+        $filterTaskView = {
+            param([AllowNull()][object[]]$InputTask)
+
+            $filteredTasks = @($InputTask)
+            if ($ActiveOnly) {
+                return @(
+                    $filteredTasks | Where-Object {
+                        $status = ConvertTo-CodexTaskTerminalStatus -Status ([string](Get-CodexFirstValue -InputObject $_ -PropertyName @('Status', 'status')))
+                        -not ($status -in @('completed', 'failed', 'error', 'canceled', 'archived'))
+                    }
+                )
+            }
+
+            if ((-not $All) -and (-not $threadParams.ContainsKey('Id'))) {
+                $recentThreshold = if ($hasSince) {
+                    [DateTimeOffset]$Since
                 }
-            )
+                else {
+                    [DateTimeOffset]::Now.AddHours(-1 * $RecentHours)
+                }
+
+                return @(
+                    $filteredTasks | Where-Object {
+                        $status = ConvertTo-CodexTaskTerminalStatus -Status ([string](Get-CodexFirstValue -InputObject $_ -PropertyName @('Status', 'status')))
+                        if ([string]::IsNullOrWhiteSpace($status)) {
+                            return $true
+                        }
+
+                        if ($status -ne 'completed') {
+                            return $true
+                        }
+
+                        $timestamp = ConvertTo-CodexDateTimeOffset -Value (Get-CodexFirstValue -InputObject $_ -PropertyName @('LastActivityAt', 'lastActivityAt', 'UpdatedAt', 'updatedAt', 'Timestamp', 'timestamp'))
+                        if ($null -eq $timestamp) {
+                            return $false
+                        }
+
+                        return ($timestamp -ge $recentThreshold)
+                    }
+                )
+            }
+
+            return @($filteredTasks)
         }
+
+        $tasks = @(& $filterTaskView $tasks)
 
         if ($Limit -gt 0) {
             $tasks = @($tasks | Select-Object -First $Limit)
+        }
+
+        if (
+            ($tasks.Count -eq 0) -and
+            (-not $threadParams.ContainsKey('Id')) -and
+            (-not $isTaskHandleInput)
+        ) {
+            $hint = if ($Refresh) {
+                'No Codex tasks match the current operator view after refresh. Use Get-CodexTask -All for older completed tasks, or widen the window with -RecentHours.'
+            }
+            elseif ($hasLocalOnly) {
+                'No local Codex tasks match the current operator view. Use Get-CodexTask -All for older completed tasks.'
+            }
+            else {
+                'No Codex tasks match the current operator view. Use Get-CodexTask -All for older completed tasks, or widen the window with -RecentHours.'
+            }
+
+            Write-Warning $hint
         }
 
         foreach ($task in @($tasks)) {
@@ -5891,6 +8622,7 @@ function Get-CodexTask {
         }
 
         return $tasks
+        }
     }
 }
 
@@ -6690,7 +9422,15 @@ Update-TypeData -TypeName 'PSUnplugged.CodexProject' -DefaultDisplayPropertySet 
 Update-TypeData -TypeName 'PSUnplugged.CodexProject.Details' -DefaultDisplayPropertySet Name, Kind, ThreadSummary, LastActive -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexThread' -DefaultDisplayPropertySet Id, Name, Project, Status, When -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTask' -DefaultDisplayPropertySet Id, Name, Project, Status, LastErrorMessage, When -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexEvent' -DefaultDisplayPropertySet When, Kind, Project, Summary -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexEvent.Raw' -DefaultDisplayPropertySet When, Kind, Project, Summary, RawEvent -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexApproval' -DefaultDisplayPropertySet When, Status, ApprovalType, Project, Target -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexApproval.Raw' -DefaultDisplayPropertySet When, Status, ApprovalType, Project, Target, RawEvent -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexArtifact' -DefaultDisplayPropertySet When, Kind, Project, Name, Summary -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexArtifact.Content' -DefaultDisplayPropertySet When, Kind, Project, Name, Summary, Content -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTranscriptItem' -DefaultDisplayPropertySet Role, Phase, When, Text -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTaskReceive' -DefaultDisplayPropertySet Id, Name, Project, Status, Summary, When -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTaskTurn' -DefaultDisplayPropertySet TaskId, Prompt, Result -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexTaskDashboardData' -DefaultDisplayPropertySet title, taskCount, activeCount, failedCount, attentionCount, generatedAt -Force
 Update-TypeData -TypeName 'PSUnplugged.CodexTranscriptPage' -DefaultDisplayPropertySet Path, ThreadCount, ItemCount, Opened -Force
+Update-TypeData -TypeName 'PSUnplugged.CodexTaskDashboardPage' -DefaultDisplayPropertySet Path, TaskCount, Opened -Force
