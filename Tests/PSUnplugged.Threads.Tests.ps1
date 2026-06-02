@@ -198,7 +198,7 @@ Describe 'PSUnplugged task lifecycle regressions' {
             }
         }
 
-        It 'refreshes by default and uses the local catalog only when requested' {
+        It 'uses the local catalog by default and refreshes only when requested' {
             InModuleScope -ModuleName $script:ModuleUnderTestName {
                 $calls = [System.Collections.Generic.List[object]]::new()
                 $spinnerCalls = [System.Collections.Generic.List[object]]::new()
@@ -231,12 +231,12 @@ Describe 'PSUnplugged task lifecycle regressions' {
                 }
 
                 $null = Get-CodexTask -Limit 25
-                $calls[0].BoundNames | Should -Not -Contain 'LocalOnly'
-                $spinnerCalls[0].Status | Should -Be 'Loading Codex tasks: reading catalog, refreshing app-server, preparing view...'
+                $calls[0].LocalOnly | Should -BeTrue
+                $spinnerCalls[0].Status | Should -Be 'Loading Codex tasks: reading local catalog and worker handles...'
 
-                $null = Get-CodexTask -LocalOnly -Limit 25
-                $calls[1].LocalOnly | Should -BeTrue
-                $spinnerCalls[1].Status | Should -Be 'Loading Codex tasks: reading local catalog and worker handles...'
+                $null = Get-CodexTask -Refresh -Limit 25
+                $calls[1].BoundNames | Should -Not -Contain 'LocalOnly'
+                $spinnerCalls[1].Status | Should -Be 'Loading Codex tasks: reading catalog, refreshing app-server, preparing view...'
             }
         }
 
@@ -618,6 +618,26 @@ Describe 'PSUnplugged task lifecycle regressions' {
     }
 
     Context 'Worker completion status' {
+        It 'skips session-file status inspection for fast task list conversion' {
+            InModuleScope -ModuleName $script:ModuleUnderTestName {
+                Mock Get-CodexTaskTerminalInfoFromSessionFile {
+                    throw 'Session inspection should not run.'
+                }
+
+                $task = [pscustomobject]@{
+                    ThreadId       = '019e057c-0ae5-7021-a840-f01ef836a9db'
+                    Status         = 'active'
+                    LastActivityAt = '2026-06-01T23:00:00-04:00'
+                }
+
+                $output = $task | ConvertTo-CodexTaskOutput -SkipSessionInspection
+
+                $output.TaskId | Should -Be '019e057c-0ae5-7021-a840-f01ef836a9db'
+                $output.Status | Should -Be 'active'
+                Should -Invoke Get-CodexTaskTerminalInfoFromSessionFile -Times 0 -Exactly
+            }
+        }
+
         It 'ignores stale worker completion for remote thread snapshots without worker metadata' {
             InModuleScope -ModuleName $script:ModuleUnderTestName {
                 Mock Get-CodexTaskTerminalStatusFromSessionFile { $null }

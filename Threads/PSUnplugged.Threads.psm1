@@ -3907,6 +3907,10 @@ function Get-CodexThread {
 
             Update-CodexSessionIndex -Thread $results
 
+            if ($Limit -gt 0 -and $results.Count -gt $Limit) {
+                $results = @($results | Select-Object -First $Limit)
+            }
+
             if ($remoteError -and $results.Count -eq 0) {
                 throw $remoteError
             }
@@ -7221,7 +7225,8 @@ function ConvertTo-CodexTaskOutput {
     param(
         [Parameter(ValueFromPipeline = $true)]
         [AllowNull()]$InputObject,
-        [PSCustomObject]$Session
+        [PSCustomObject]$Session,
+        [switch]$SkipSessionInspection
     )
 
     process {
@@ -7235,19 +7240,27 @@ function ConvertTo-CodexTaskOutput {
         }
 
         $null = $InputObject | Add-Member -NotePropertyName TaskId -NotePropertyValue $taskId -Force
-        $sessionPath = Resolve-CodexTaskSessionPath -InputObject $InputObject
-        $terminalInfo = Get-CodexTaskTerminalInfoFromSessionFile -Path $sessionPath
-        $terminalErrorMessage = [string](Get-CodexFirstValue -InputObject $terminalInfo -PropertyName @('ErrorMessage'))
-        if (-not [string]::IsNullOrWhiteSpace($terminalErrorMessage)) {
-            $null = $InputObject | Add-Member -NotePropertyName LastErrorMessage -NotePropertyValue $terminalErrorMessage -Force
+        $terminalStatus = ConvertTo-CodexTaskTerminalStatus -Status ([string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('LastTurnStatus', 'lastTurnStatus', 'Status', 'status')))
+        if ((-not $SkipSessionInspection) -and -not ($terminalStatus -in @('completed', 'failed', 'error', 'canceled', 'archived'))) {
+            $sessionPath = Resolve-CodexTaskSessionPath -InputObject $InputObject
+            $terminalInfo = Get-CodexTaskTerminalInfoFromSessionFile -Path $sessionPath
+            $terminalErrorMessage = [string](Get-CodexFirstValue -InputObject $terminalInfo -PropertyName @('ErrorMessage'))
+            if (-not [string]::IsNullOrWhiteSpace($terminalErrorMessage)) {
+                $null = $InputObject | Add-Member -NotePropertyName LastErrorMessage -NotePropertyValue $terminalErrorMessage -Force
+            }
+
+            $terminalStatus = [string](Get-CodexFirstValue -InputObject $terminalInfo -PropertyName @('Status'))
+            if (-not [string]::IsNullOrWhiteSpace($terminalStatus) -and $terminalStatus -in @('completed', 'failed', 'error', 'canceled', 'archived')) {
+                $null = $InputObject | Add-Member -NotePropertyName LastTurnStatus -NotePropertyValue $terminalStatus -Force
+            }
         }
 
-        $terminalStatus = [string](Get-CodexFirstValue -InputObject $terminalInfo -PropertyName @('Status'))
-        if (-not [string]::IsNullOrWhiteSpace($terminalStatus) -and $terminalStatus -in @('completed', 'failed', 'error', 'canceled', 'archived')) {
-            $null = $InputObject | Add-Member -NotePropertyName LastTurnStatus -NotePropertyValue $terminalStatus -Force
+        $effectiveStatus = if ($SkipSessionInspection) {
+            ConvertTo-CodexTaskTerminalStatus -Status ([string](Get-CodexFirstValue -InputObject $InputObject -PropertyName @('LastTurnStatus', 'lastTurnStatus', 'Status', 'status')))
         }
-
-        $effectiveStatus = Get-CodexTaskEffectiveStatus -InputObject $InputObject
+        else {
+            Get-CodexTaskEffectiveStatus -InputObject $InputObject
+        }
         if (-not [string]::IsNullOrWhiteSpace($effectiveStatus)) {
             $null = $InputObject | Add-Member -NotePropertyName Status -NotePropertyValue $effectiveStatus -Force
         }
@@ -8218,7 +8231,7 @@ function Get-CodexTaskTerminalInfoFromSessionFile {
 
     $taskCompleted = $false
     $assistantOutputSeen = $false
-    foreach ($line in @(Get-Content -LiteralPath $fileInfo.FullName -ErrorAction SilentlyContinue)) {
+    foreach ($line in @(Get-Content -LiteralPath $fileInfo.FullName -Tail 400 -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
         }
@@ -8931,6 +8944,13 @@ function Get-CodexTask {
         $threadParams.SpinnerStatus = $null
         $hasSince = $PSBoundParameters.ContainsKey('Since')
         $hasLocalOnly = $PSBoundParameters.ContainsKey('LocalOnly')
+        if ((-not $Refresh) -and (-not $Session) -and (-not $hasLocalOnly)) {
+            $threadParams.LocalOnly = $true
+            $hasLocalOnly = $true
+        }
+        if ($hasLocalOnly -and -not $PSBoundParameters.ContainsKey('SpinnerStatus')) {
+            $SpinnerStatus = 'Loading Codex tasks: reading local catalog and worker handles...'
+        }
 
         return Invoke-PSUnpluggedWithSpinner -Status $SpinnerStatus -ScriptBlock {
         if ($PSBoundParameters.ContainsKey('IncludeArchived')) {
@@ -8980,7 +9000,8 @@ function Get-CodexTask {
             $pendingWorkerTasks = @(Get-PSUnpluggedTaskWorkerHandles -ProjectPath $workerProjectPath)
         }
 
-        $tasks = @($pendingWorkerTasks + @(Get-CodexThread @threadParams | ConvertTo-CodexTaskOutput -Session $Session))
+        $skipSessionInspection = -not $threadParams.ContainsKey('Id')
+        $tasks = @($pendingWorkerTasks + @(Get-CodexThread @threadParams | ConvertTo-CodexTaskOutput -Session $Session -SkipSessionInspection:$skipSessionInspection))
         if ($archivedThreadIds -and $archivedThreadIds.Count -gt 0) {
             $tasks = @(
                 $tasks | Where-Object {
@@ -9150,13 +9171,18 @@ function Receive-CodexTask {
             if (-not [string]::IsNullOrWhiteSpace($taskId)) {
                 $pipelineTranscriptInputs.Add([string]$taskId)
 
-                $task = Get-CodexTask -Id ([string]$taskId) -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
-                Select-Object -First 1
-                if ($task) {
-                    $taskLookup[[string]$taskId] = $task
+                if ($item.PSObject.TypeNames -contains 'PSUnplugged.CodexTask') {
+                    $taskLookup[[string]$taskId] = $item
                 }
                 else {
-                    $taskLookup[[string]$taskId] = $item
+                    $task = Get-CodexTask -Id ([string]$taskId) -IncludeArchived:$IncludeArchived -LocalOnly:$LocalOnly -Limit 1 -Session $Session -SpinnerStatus $null |
+                    Select-Object -First 1
+                    if ($task) {
+                        $taskLookup[[string]$taskId] = $task
+                    }
+                    else {
+                        $taskLookup[[string]$taskId] = $item
+                    }
                 }
 
                 continue
@@ -9176,7 +9202,7 @@ function Receive-CodexTask {
                 SpinnerStatus = 'Receiving Codex task output...'
             }
             if ($IncludeArchived) { $pipelineTranscriptParams.IncludeArchived = $true }
-            if ($LocalOnly) { $pipelineTranscriptParams.LocalOnly = $true }
+            if ($LocalOnly -or (-not $Session)) { $pipelineTranscriptParams.LocalOnly = $true }
             if ($Session) { $pipelineTranscriptParams.Session = $Session }
             if ($telemetryTypes.Count -gt 0) {
                 $pipelineTranscriptParams.IncludeTelemetry = $true
