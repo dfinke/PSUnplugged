@@ -11,7 +11,13 @@ If `Start-Job`, `Get-Job`, and `Receive-Job` are already in your fingers, this l
 - `Start-CodexSession` is the connected runtime context.
 - `New-CodexThread` starts a unit of agent work.
 - `Get-CodexThread` is the main inspection surface.
-- `Get-CodexTranscript` is today's closest analogue to "receive the latest useful output."
+- `Receive-CodexTask` receives task output, like `Receive-Job`.
+- `Get-CodexTranscript` returns the conversation-shaped history.
+- `Get-CodexEvent` returns the operational event stream.
+- `Get-CodexApproval` returns observed approval requests.
+- `Get-CodexArtifact` returns durable files and materialized task views.
+- `ConvertTo-CodexTaskDashboardData` returns the JSON-ready dashboard data contract.
+- `Show-CodexTaskDashboard` opens a local dashboard over the task substrate.
 - `Enter-CodexThread` and `Resume-CodexThread` are how you pick work back up.
 
 The important difference is that a Codex thread is richer than a background job. It carries state, transcript history, and project metadata, so the workflow is still PowerShell-shaped but more conversational and recoverable.
@@ -23,12 +29,17 @@ The important difference is that a Codex thread is richer than a background job.
 - `New-CodexPlaygroundProject`
 - `Start-CodexTask`
 - `Get-CodexTask`
+- `Get-CodexApproval`
+- `Get-CodexArtifact`
 - `Wait-CodexTask`
 - `Receive-CodexTask`
 - `Resume-CodexTask`
 - `Remove-CodexTask`
 - `Get-CodexThread`
+- `ConvertTo-CodexTaskDashboardData`
 - `Get-CodexTranscript`
+- `Get-CodexEvent`
+- `Show-CodexTaskDashboard`
 - `Show-CodexTranscript`
 - `Set-CodexThread`
 - `Remove-CodexThread`
@@ -69,7 +80,13 @@ $tasks = @(
 ) | Start-CodexTask -Cwd .
 
 $tasks | Get-CodexTask
-$tasks | Receive-CodexTask -Transcript -ShowTelemetry
+$tasks | Receive-CodexTask
+$tasks | Get-CodexEvent -Kind Command,ToolCall,Reasoning
+$tasks | Get-CodexApproval
+$tasks | Get-CodexArtifact
+$tasks | ConvertTo-CodexTaskDashboardData | ConvertTo-Json -Depth 20
+$tasks | Show-CodexTaskDashboard
+$tasks | ConvertTo-CodexTaskDashboardData | Show-CodexTaskDashboard
 ```
 
 Live tail for long-running work:
@@ -123,6 +140,16 @@ Get-CodexTranscript -Id <thread-id>
 Get-CodexThread -Project Research | Get-CodexTranscript
 Get-CodexThread -Project PSUnplugged | Select-Object -First 1 | Show-CodexTranscript
 Get-CodexTranscript -Id <thread-id> | Show-CodexTranscript -NoOpen -PassThru
+```
+
+Open the task dashboard:
+
+```powershell
+Get-CodexTask | ConvertTo-CodexTaskDashboardData | ConvertTo-Json -Depth 20
+Get-CodexTask | Show-CodexTaskDashboard
+Get-CodexTask | ConvertTo-CodexTaskDashboardData | Show-CodexTaskDashboard
+Get-CodexTask -ActiveOnly | Show-CodexTaskDashboard -Title "Active Codex Work"
+Get-CodexTask | Show-CodexTaskDashboard -NoOpen -PassThru
 ```
 
 Pipeline from projects to threads:
@@ -226,7 +253,9 @@ It does not currently delete the remote Codex thread from the app-server.
 
 - `Start-CodexTask / Get-CodexTask / Wait-CodexTask / Receive-CodexTask` give you the job-style operator surface.
 - `Start-CodexTask` defaults to `gpt-5.2`, matching the minimum supported Codex runtime model.
-- `Get-CodexTask` defaults to the current working directory (`-Project '*'` lists everything), and `-ActiveOnly` keeps the view focused on tasks that are still in play.
+- `Get-CodexTask` lists active/attention tasks plus recently completed tasks across projects, like an operator board; use `-Project .` for the current project, `-ActiveOnly` for tasks still in play, and `-All` for older completed task history.
+- `Get-CodexTask -RecentHours 12` and `Get-CodexTask -Since (Get-Date).Date` tune the completed-task window; the default window is 4 hours.
+- `Get-CodexTask -LocalOnly` skips the Codex app-server refresh when you want the fastest local catalog view.
 - `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
 - `Get-CodexTask` surfaces task errors in the default table when a worker stops before Codex reports completion.
 - `Start-CodexTask -CreateCwd` lets task-first workflows create a new working folder without a separate setup step.
@@ -239,6 +268,11 @@ It does not currently delete the remote Codex thread from the app-server.
 - `Receive-CodexTask -Transcript -ShowAll` is still supported when you prefer explicit switches.
 - `-ShowReasoning`, `-ShowTools`, and `-ShowCommands` remain available when you only want one telemetry slice.
 - In the default summary view, telemetry switches are ignored so the summary stays focused on the latest assistant output or task state.
+- `Get-CodexEvent` gives you the operational event stream for task telemetry, including commands, tools, reasoning, approvals, messages, and lifecycle events.
+- `Get-CodexApproval` gives you a read-only approval request view. It does not approve or deny requests yet.
+- `Get-CodexArtifact` gives you artifact-shaped task outputs from the existing durable store: session JSONL, latest result text, transcript, and event log.
+- `ConvertTo-CodexTaskDashboardData` is the handoff point for custom frontends: PowerShell owns the task object flow, and the UI can own rendering.
+- `Show-CodexTaskDashboard` gives you an Argus-style local dashboard snapshot with focused/verbose views and natural-language filtering over task state.
 - `Get-CodexProject` always returns project objects.
 - `Get-CodexThread` always returns thread objects.
 - Wildcards are supported for project selection.

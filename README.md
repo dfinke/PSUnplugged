@@ -167,7 +167,13 @@ $tasks = @(
 ) | Start-CodexTask -Cwd .
 
 $tasks | Get-CodexTask
-$tasks | Receive-CodexTask -Transcript -ShowTelemetry
+$tasks | Receive-CodexTask
+$tasks | Get-CodexEvent -Kind Command,ToolCall,Reasoning
+$tasks | Get-CodexApproval
+$tasks | Get-CodexArtifact
+$tasks | ConvertTo-CodexTaskDashboardData | ConvertTo-Json -Depth 20
+$tasks | Show-CodexTaskDashboard
+$tasks | ConvertTo-CodexTaskDashboardData | Show-CodexTaskDashboard
 ```
 
 **Live tail for long-running work**
@@ -248,8 +254,10 @@ PSUnplugged works best when you think about agent work the way PowerShell alread
 - `Start-CodexTask` is the task-first operator surface when you want job-style language.
 - `Start-CodexTask` defaults to `gpt-5.2`, matching the minimum supported Codex runtime model.
 - `New-CodexThread` starts a unit of agent work in that runtime.
-- `Get-CodexTask` is the task-first inspection view and defaults to the current working directory (`-Project '*'` lists everything).
-- `Get-CodexTask -ActiveOnly` narrows that view to tasks that are still in play.
+- `Get-CodexTask` is the task-first inspection view and lists active/attention tasks plus recently completed tasks across projects, like an operator board.
+- `Get-CodexTask -Project .` scopes the view to the current project, `-ActiveOnly` narrows the view to tasks that are still in play, and `-All` includes older completed task history.
+- `Get-CodexTask -RecentHours 12` or `Get-CodexTask -Since (Get-Date).Date` tunes the completed-task window; the default window is 4 hours.
+- `Get-CodexTask -LocalOnly` skips the Codex app-server refresh when you want the fastest local catalog view.
 - `Get-CodexTask` also shows `starting` tasks while their worker process is booting.
 - `Get-CodexTask` surfaces task errors in the default table when a worker stops before Codex reports completion.
 - `Start-CodexTask -TurnTimeoutSec <n>` controls the task worker's Codex turn wait; the default is 900 seconds.
@@ -262,7 +270,12 @@ PSUnplugged works best when you think about agent work the way PowerShell alread
 - `Receive-CodexTask` gives you a compact latest-output summary by default.
 - `Receive-CodexTask -Text` returns the full latest assistant text.
 - `Receive-CodexTask -Transcript` returns the full transcript. Add `-ShowAll` for reasoning, tools, and commands, or use `-Details` as the short form for `-Transcript -ShowAll`. In the default summary view, telemetry switches are ignored so the summary stays focused on the latest assistant output or task state.
-- `Get-CodexTranscript` is the current "receive the useful output" view for a thread.
+- `Get-CodexTranscript` returns the conversation-shaped history for a thread.
+- `Get-CodexEvent` returns the operational event stream for a task: commands, tools, reasoning, approvals, messages, and lifecycle events.
+- `Get-CodexApproval` returns observed approval requests as read-only objects.
+- `Get-CodexArtifact` returns durable task artifacts and materialized views: session JSONL, latest result text, transcript, and event log.
+- `ConvertTo-CodexTaskDashboardData` returns the stable JSON-ready data contract for a custom dashboard frontend.
+- `Show-CodexTaskDashboard` builds a local browser dashboard over tasks, latest output, events, artifacts, approvals, and an NLP-style command bar for filtering.
 - `Resume-CodexTask` lets you continue the same unit of work with another prompt.
 - `Start-CodexTask -CreateCwd` can create a missing working folder before the task starts.
 - `Enter-CodexThread` and `Resume-CodexThread` let you pick work back up.
